@@ -1,0 +1,2759 @@
+#!/usr/bin/env python3
+"""
+Simple Interactive Telegram Bot for Poll Creation - Python 3.13 Compatible
+"""
+
+import asyncio
+import logging
+import time
+from datetime import datetime, timedelta
+import os
+
+# Try to load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
+# Configure logging with file output
+import sys
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+
+
+def setup_bot_logging():
+    """Set up comprehensive logging with file rotation for bot"""
+    # Create logs directory if it doesn't exist
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
+    # Create formatters
+    detailed_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
+    )
+
+    simple_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    # Get root logger
+    root_logger = logging.getLogger()
+
+    # Only set up if not already configured
+    if not root_logger.handlers:
+        root_logger.setLevel(logging.INFO)
+
+        # File handler for bot logs (with rotation)
+        bot_logs_file = os.path.join(log_dir, 'bot.log')
+        file_handler = RotatingFileHandler(
+            bot_logs_file,
+            maxBytes=10 * 1024 * 1024,  # 10MB
+            backupCount=5,
+            encoding='utf-8'
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(detailed_formatter)
+        root_logger.addHandler(file_handler)
+
+        # Error file handler (errors only)
+        error_logs_file = os.path.join(log_dir, 'bot_errors.log')
+        error_handler = RotatingFileHandler(
+            error_logs_file,
+            maxBytes=5 * 1024 * 1024,  # 5MB
+            backupCount=3,
+            encoding='utf-8'
+        )
+        error_handler.setLevel(logging.ERROR)
+        error_handler.setFormatter(detailed_formatter)
+        root_logger.addHandler(error_handler)
+
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(simple_formatter)
+        root_logger.addHandler(console_handler)
+
+        # Log startup message
+        root_logger.info("=" * 50)
+        root_logger.info(f"Bot logging initialized at {datetime.now()}")
+        root_logger.info(f"Log directory: {os.path.abspath(log_dir)}")
+        root_logger.info("=" * 50)
+
+    return root_logger
+
+
+# Initialize logging
+setup_bot_logging()
+logger = logging.getLogger(__name__)
+
+try:
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
+    from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, \
+        PollAnswerHandler, MessageReactionHandler
+except ImportError:
+    print("❌ python-telegram-bot not installed!")
+    print("📝 Install it with: py -m pip install python-telegram-bot")
+    exit(1)
+
+# Timeout constants (in seconds)
+SESSION_TIMEOUT = 86400  # 24 hours
+POLL_VOTING_TIMEOUT = 3600  # 1 hour
+CONFIRMATION_REACTION_TIMEOUT = 3600  # 1 hour
+# PROCEED_CONFIRMATION_TIMEOUT = 60  # 1 minute (removed - no timeout for proceed buttons)
+CLEANUP_INTERVAL = 3600  # 1 hour
+FALLBACK_WAIT_TIME = 5  # 5 seconds for past times
+IMMEDIATE_CONFIRMATION_DELAY = 60  # 1 minute delay for immediate confirmation
+
+
+class SimplePollBot:
+    def __init__(self, token):
+        self.token = token
+        self.sessions = {}  # Format: {chat_id: {user_id: session_data}}
+        self.active_polls = {}  # Track active polls and their voters
+        self.confirmation_messages = {}  # Track confirmation messages and reactions
+        self.pinned_messages = {}  # Track pinned messages for unpinning
+        self.scheduled_tasks = {}  # Track scheduled tasks for cancellation
+        self.cleanup_task = None  # Track cleanup task
+        self.user_vote_states = {}  # Track each user's last known vote state for retraction detection
+        self.immediate_confirmation_messages = {}  # Track immediate confirmation messages
+
+        # Session timeout: 24 hours (86400 seconds)
+        self.session_timeout = SESSION_TIMEOUT
+
+    def start_cleanup_task(self):
+        """Start the session cleanup task if not already running"""
+        if self.cleanup_task is None or self.cleanup_task.done():
+            try:
+                self.cleanup_task = asyncio.create_task(self.cleanup_expired_sessions())
+                logger.info("✅ Session cleanup task started")
+            except RuntimeError as e:
+                logger.warning(f"Could not start cleanup task: {e}")
+
+    def get_day_name(self, date):
+        """Get Russian day name"""
+        days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+        return days[date.weekday()]
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        text = (
+            "👋 Привет! Я бот для планирования встреч и создания опросов.\n\n"
+            "🗳️ Команды:\n"
+            "/create_poll - Создать новый опрос для встречи\n"
+            "/cancel_bot - Отменить все задачи и открепить сообщения\n\n"
+            "✨ Что я умею:\n"
+            "• 📅 Создание опросов с датами и временем\n"
+            "• 🎯 Автоматическое определение лучшего варианта\n"
+            "• ⏰ Умные напоминания и подтверждения\n"
+            "• 📌 Закрепление важных сообщений\n"
+            "• 💪 Подтверждение участия перед встречей\n"
+            "• 🎉 Отслеживание готовности всех участников\n\n"
+            "🔄 Как это работает:\n"
+            "1️⃣ Выбираешь вопрос (по умолчанию 'Собираемся?')\n"
+            "2️⃣ Выбираешь дни из ближайших 7 дней\n"
+            "3️⃣ Выбираешь удобное время\n"
+            "4️⃣ Создается опрос для голосования\n"
+            "5️⃣ Автоматически определяется результат и закрепляется\n"
+            "6️⃣ Отправляется подтверждение участия за 24ч/3ч до встречи\n"
+            "7️⃣ Сообщение открепляется через 10 часов после встречи\n"
+            "8️⃣ Спрашиваю 'Как прошла встреча?' через 3 дня\n\n"
+            "🚀 Начни планировать встречу с /create_poll!"
+        )
+        await update.message.reply_text(text)
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /help command - show command usage and scheduling rules"""
+        help_text = (
+            "📚 **Справка по командам**\n\n"
+            "🗳️ **Команды:**\n"
+            "`/start` - Приветственное сообщение с возможностями бота\n"
+            "`/help` - Показать справку по командам и правилам планирования\n"
+            "`/info` - Краткое руководство по использованию бота\n"
+            "`/create_poll` - Начать создание нового опроса\n"
+            "`/cancel_bot` - Отменить все запланированные события и открепить сообщения\n"
+            "`/die` - Секретная команда... Попробуйте на свой страх и риск 💀\n\n"
+            "⏰ **Правила планирования:**\n"
+            "• **Время голосования:** 1 час на голосование\n"
+            "• **Мгновенное подтверждение:** через 1 минуту после закрытия опроса\n"
+            "• **Подтверждение перед встречей:**\n"
+            "  - Если встреча >24ч → за 24 часа до встречи\n"
+            "  - Если встреча 3-24ч → за 3 часа до встречи\n"
+            "  - Если встреча <3ч → подтверждение не отправляется\n"
+            "• **Открепление сообщений:** через 10 часов после встречи\n"
+            "• **Вопрос о встрече:** через 72 часа после встречи\n\n"
+            "🌍 **Часовой пояс:** Все время в польском часовом поясе (Europe/Warsaw)\n\n"
+            "💡 **Советы:**\n"
+            "• Только один опрос на чат одновременно\n"
+            "• Бот отслеживает голосующих и отправляет умные напоминания\n"
+            "• Автоматическое определение результата и подтверждение встречи\n"
+            "• Используйте `/cancel_bot` чтобы остановить все запланированные действия"
+        )
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+
+    async def info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /info command - summary of how to use the bot"""
+        info_text = (
+            "ℹ️ **Как пользоваться ботом**\n\n"
+            "🎯 **Цель:** Планирование встреч через опросы\n\n"
+            "📋 **Пошаговая инструкция:**\n"
+            "1️⃣ Напишите `/create_poll`\n"
+            "2️⃣ Выберите или введите вопрос (по умолчанию 'Собираемся?')\n"
+            "3️⃣ Выберите дни из ближайших 7 дней\n"
+            "4️⃣ Выберите подходящее время\n"
+            "5️⃣ Бот создаст опрос для голосования\n\n"
+            "🤖 **Что происходит автоматически:**\n"
+            "• Через час бот пингует непроголосовавших\n"
+            "• После голосования всех - определяется результат\n"
+            "• Результат закрепляется в чате\n"
+            "• Через минуту - запрос подтверждения участия\n"
+            "• Перед встречей - финальное подтверждение\n"
+            "• После встречи - сообщение открепляется\n"
+            "• Через 3 дня - вопрос о том, как прошла встреча\n\n"
+            "⚡ **Особенности:**\n"
+            "• Умное определение лучшего варианта времени\n"
+            "• Отслеживание готовности всех участников\n"
+            "• Поддержка польского часового пояса\n"
+            "• Защита от дублирования голосов\n\n"
+            "❓ Нужна помощь? Используйте `/help` для подробной справки!"
+        )
+        await update.message.reply_text(info_text, parse_mode='Markdown')
+
+    async def die_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /die command — now with fun fantasy responses only"""
+        try:
+            user_id = update.effective_user.id
+            chat_id = update.effective_chat.id
+            chat_type = update.effective_chat.type
+            user_mention = f"@{update.effective_user.username}" if update.effective_user.username else f"[{update.effective_user.first_name}](tg://user?id={user_id})"
+
+            logger.info(f"🎯 Die command triggered by user {user_id} in chat {chat_id}")
+
+            if chat_type == 'private':
+                await update.message.reply_text(
+                    "💀 В личных сообщениях нельзя умереть! Попробуйте в группе! 😄"
+                )
+                return
+
+            fantasy_messages = [
+                "🔥 {user} получил 12 урона от огненного шара!",
+                "💀 {user} провалил спасбросок и упал в яму.",
+                "🧊 {user} заморожен магией льда на 10 секунд.",
+                "⚡ {user} поражён молнией из ниоткуда!",
+                "🕳 {user} провалился сквозь портал в другое измерение.",
+                "👻 Духи отвергли {user} — перерождение отклонено.",
+                "🩸 {user} случайно укололся ядовитой иглой.",
+                "🐉 Дракон пролетел мимо и испепелил {user}.",
+                "🔮 {user} оказался в ловушке иллюзии и сошёл с ума.",
+                "🪓 {user} атакован топором берсерка!",
+                "📜 {user} прочитал запрещённое заклинание и исчез.",
+                "🧠 Мозг {user} перегрелся от чёрной магии.",
+                "🪦 {user} попытался умереть, но смерть в отпуске.",
+                "🥀 {user} увял от грусти и одиночества.",
+                "💫 {user} был унесён космическими силами во Вселенную мемов.",
+            ]
+
+            import random
+            message = random.choice(fantasy_messages).format(user=user_mention)
+
+            if user_mention.startswith('@'):
+                await update.message.reply_text(message)
+            else:
+                await update.message.reply_text(message, parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"💥 Critical error in die_command: {e}")
+            await update.message.reply_text("💀 Произошла фатальная ошибка при попытке умереть! 🤖")
+
+    async def create_poll(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start poll creation"""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        # Check if someone else is already creating a poll in this chat
+        if chat_id in self.sessions:
+            creator_id = next(iter(self.sessions[chat_id].keys()))
+            if user_id != creator_id:
+                try:
+                    # Get the creator's info
+                    creator_info = await context.bot.get_chat_member(chat_id, creator_id)
+                    creator_user = creator_info.user
+                    if creator_user.username:
+                        creator_mention = f"@{creator_user.username}"
+                    else:
+                        creator_mention = creator_user.first_name
+                except:
+                    creator_mention = f"пользователь {creator_id}"
+
+                await update.message.reply_text(
+                    f"В этом чате уже создается опрос пользователем {creator_mention}. Подождите, пока он закончит.")
+                return
+
+        current_time = datetime.now()
+
+        # Initialize chat sessions if not exists
+        if chat_id not in self.sessions:
+            self.sessions[chat_id] = {}
+
+        self.sessions[chat_id][user_id] = {
+            'step': 'question',
+            'question': None,
+            'days': [],
+            'times': [],
+            'chat_id': chat_id,
+            'created_at': current_time,
+            'last_activity': current_time
+        }
+
+        keyboard = [
+            [InlineKeyboardButton("Использовать 'Собираемся?' 🎯", callback_data="default_q")],
+            [InlineKeyboardButton("Ввести свой вопрос ✏️", callback_data="custom_q")]
+        ]
+        await update.message.reply_text(
+            "1️⃣ Выбери вопрос для опроса:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle button presses"""
+        query = update.callback_query
+        await query.answer()
+
+        user_id = update.effective_user.id
+        chat_id = query.message.chat_id
+        data = query.data
+
+        # Handle proceed confirmation buttons (these don't need session check)
+        if data.startswith('proceed_'):
+            await self.handle_proceed_button(update, context, data)
+            return
+
+        # Only check sessions for poll creation buttons
+        if chat_id not in self.sessions or user_id not in self.sessions[chat_id]:
+            # Check if someone else is creating a poll in this chat
+            if chat_id in self.sessions and self.sessions[chat_id]:
+                creator_id = next(iter(self.sessions[chat_id].keys()))
+                try:
+                    # Get the creator's info
+                    creator_info = await context.bot.get_chat_member(chat_id, creator_id)
+                    creator_user = creator_info.user
+                    if creator_user.username:
+                        creator_mention = f"@{creator_user.username}"
+                    else:
+                        creator_mention = creator_user.first_name
+                except:
+                    creator_mention = f"пользователь {creator_id}"
+
+                await query.answer(f"Только {creator_mention} может выбирать опции", show_alert=True)
+            else:
+                await query.edit_message_text("❌ Сессия истекла. Используй /create_poll для создания нового опроса.")
+            return
+
+        # Update last activity timestamp
+        self.sessions[chat_id][user_id]['last_activity'] = datetime.now()
+
+        session = self.sessions[chat_id][user_id]
+
+        if data == "default_q":
+            session['question'] = "Собираемся?"
+            await self.show_days(query, user_id, chat_id)
+        elif data == "custom_q":
+            session['step'] = 'waiting_question'
+            await query.edit_message_text("✏️ Введи свой вопрос:")
+        elif data.startswith("day_"):
+            day_idx = int(data.split("_")[1])
+            if day_idx in session['days']:
+                session['days'].remove(day_idx)
+            else:
+                session['days'].append(day_idx)
+            await self.show_days(query, user_id, chat_id)
+        elif data == "days_done":
+            if not session['days']:
+                await query.answer("❌ Выбери хотя бы один день!", show_alert=True)
+                return
+            await self.show_times(query, user_id, chat_id)
+        elif data.startswith("time_"):
+            time = data.split("_", 1)[1]
+            if time in session['times']:
+                session['times'].remove(time)
+            else:
+                session['times'].append(time)
+            await self.show_times(query, user_id, chat_id)
+        elif data == "times_done":
+            if not session['times']:
+                await query.answer("❌ Выбери хотя бы одно время!", show_alert=True)
+                return
+            await self.create_final_poll(query, user_id, chat_id, context)
+        elif data.startswith("pin_yes_"):
+            poll_id = data.split("pin_yes_")[1]
+            await self.handle_pin_proposal(query, poll_id, True, context)
+        elif data.startswith("pin_no_"):
+            poll_id = data.split("pin_no_")[1]
+            await self.handle_pin_proposal(query, poll_id, False, context)
+        elif data.startswith("ignore_yes_"):
+            parts = data.split("ignore_yes_")[1].split("_", 1)
+            poll_id = parts[0]
+            cant_make_it_user_id = int(parts[1])
+            await self.handle_ignore_confirmation(query, poll_id, cant_make_it_user_id, True, context)
+        elif data.startswith("ignore_no_"):
+            poll_id = data.split("ignore_no_")[1]
+            await self.handle_ignore_confirmation(query, poll_id, None, False, context)
+        elif data.startswith("ignore_multiple_yes_"):
+            poll_id = data.split("ignore_multiple_yes_")[1]
+            await self.handle_multiple_ignore_confirmation(query, poll_id, True, context)
+        elif data.startswith("ignore_multiple_no_"):
+            poll_id = data.split("ignore_multiple_no_")[1]
+            await self.handle_multiple_ignore_confirmation(query, poll_id, False, context)
+
+    async def text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle text input"""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        if (chat_id in self.sessions and user_id in self.sessions[chat_id] and
+                self.sessions[chat_id][user_id]['step'] == 'waiting_question'):
+            # Update last activity timestamp
+            self.sessions[chat_id][user_id]['last_activity'] = datetime.now()
+            self.sessions[chat_id][user_id]['question'] = update.message.text
+            await self.show_days_new_message(update, user_id, chat_id)
+
+    async def show_days(self, query, user_id, chat_id):
+        """Show day selection"""
+        session = self.sessions[chat_id][user_id]
+        today = datetime.now()
+
+        keyboard = []
+        for i in range(7):
+            day = today + timedelta(days=i)
+            day_name = self.get_day_name(day)
+            date_str = day.strftime("%d.%m")
+            selected = "✅" if i in session['days'] else "📅"
+            keyboard.append([InlineKeyboardButton(
+                f"{selected} {day_name} ({date_str})",
+                callback_data=f"day_{i}"
+            )])
+
+        keyboard.append([InlineKeyboardButton("Готово ➡️", callback_data="days_done")])
+
+        text = f"2️⃣ Выбери дни для '{session['question']}':"
+        if session['days']:
+            text += f"\n\nВыбрано дней: {len(session['days'])}"
+
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    async def show_days_new_message(self, update, user_id, chat_id):
+        """Show days as new message"""
+        session = self.sessions[chat_id][user_id]
+        today = datetime.now()
+
+        keyboard = []
+        for i in range(7):
+            day = today + timedelta(days=i)
+            day_name = self.get_day_name(day)
+            date_str = day.strftime("%d.%m")
+            keyboard.append([InlineKeyboardButton(
+                f"📅 {day_name} ({date_str})",
+                callback_data=f"day_{i}"
+            )])
+
+        keyboard.append([InlineKeyboardButton("Готово ➡️", callback_data="days_done")])
+
+        await update.message.reply_text(
+            f"2️⃣ Выбери дни для '{session['question']}':",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def show_times(self, query, user_id, chat_id):
+        """Show time selection"""
+        session = self.sessions[chat_id][user_id]
+        times = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00",
+                 "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00"]
+
+        keyboard = []
+        row = []
+        for time in times:
+            selected = "✅" if time in session['times'] else "🕐"
+            row.append(InlineKeyboardButton(f"{selected} {time}", callback_data=f"time_{time}"))
+            if len(row) == 3:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+
+        keyboard.append([InlineKeyboardButton("Готово ➡️", callback_data="times_done")])
+
+        text = f"3️⃣ Выбери время для '{session['question']}':"
+        if session['times']:
+            text += f"\n\nВыбрано времен: {len(session['times'])}"
+
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    async def create_final_poll(self, query, user_id, chat_id, context):
+        """Create the final poll"""
+        session = self.sessions[chat_id][user_id]
+        today = datetime.now()
+
+        options = []
+        for day_idx in sorted(session['days']):
+            day = today + timedelta(days=day_idx)
+            day_name = self.get_day_name(day)
+            date_str = day.strftime("%d.%m")
+            for time in sorted(session['times']):
+                options.append(f"{day_name} ({date_str}) в {time}")
+
+        options.append("Не могу 😔")
+
+        try:
+            poll_message = await context.bot.send_poll(
+                chat_id=session['chat_id'],
+                question=session['question'],
+                options=options,
+                is_anonymous=False,
+                allows_multiple_answers=True
+            )
+
+            # Track this poll for voting monitoring
+            poll_id = poll_message.poll.id
+            self.active_polls[poll_id] = {
+                'chat_id': session['chat_id'],
+                'question': session['question'],
+                'vote_count': 0,  # Simple counter instead of tracking user IDs
+                'target_member_count': 1,  # Will be updated by get_chat_members_and_monitor
+                'context': context,
+                'creator_id': user_id,  # Track who created the poll
+                'poll_message_id': poll_message.message_id,  # Store message ID to get poll results
+                'options': options,  # Store options to map results
+                'vote_counts': {}  # Track votes manually as fallback
+            }
+
+            # Get chat members and start monitoring
+            await self.get_chat_members_and_monitor(poll_id, session['chat_id'], context)
+
+            await query.edit_message_text(
+                f"✅ Опрос '{session['question']}' создан!\n"
+                f"📊 Вариантов: {len(options)}\n"
+                f"💪 Отправлю подтверждение участия перед встречей\n"
+                f"🎉 Уведомлю когда все будут готовы!"
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ Ошибка: {e}")
+
+        # Clean up session
+        if chat_id in self.sessions and user_id in self.sessions[chat_id]:
+            del self.sessions[chat_id][user_id]
+            if not self.sessions[chat_id]:  # Remove empty chat session
+                del self.sessions[chat_id]
+
+    #     Get chat gets only admins
+    async def get_chat_members_and_monitor(self, poll_id, chat_id, context):
+        """Get chat member count and start monitoring poll votes"""
+        try:
+            # Get chat info
+            chat = await context.bot.get_chat(chat_id)
+
+            if chat.type == 'private':
+                # In private chat, target is 1 member
+                logger.info(f"Private chat detected for poll {poll_id}")
+                self.active_polls[poll_id]['target_member_count'] = 1
+                logger.info(f"Private chat target: 1 member")
+            else:
+                # Group chat - use getChatMemberCount API
+                try:
+                    total_members = await context.bot.get_chat_member_count(chat_id)
+                    # Exclude bots from the count (at least this bot)
+                    human_members = max(1, total_members - 1)
+                    self.active_polls[poll_id]['target_member_count'] = human_members
+                    logger.info(
+                        f"Chat {chat_id} has {total_members} total members, {human_members} human members (via getChatMemberCount)")
+                except Exception as e:
+                    logger.warning(f"getChatMemberCount failed: {e}, trying fallback")
+                    # Fallback to chat.member_count if available
+                    total_members = getattr(chat, 'member_count', 1)
+                    # Exclude bots from the count (at least this bot)
+                    human_members = max(1, total_members - 1)
+                    self.active_polls[poll_id]['target_member_count'] = human_members
+                    logger.info(
+                        f"Fallback: Chat {chat_id} has {total_members} total members, {human_members} human members (via chat.member_count)")
+
+            logger.info(
+                f"Starting 1-hour timer for poll {poll_id} with target: {self.active_polls[poll_id]['target_member_count']} members")
+            # Start the 1-hour timer
+            asyncio.create_task(self.monitor_poll_voting(poll_id))
+
+        except Exception as e:
+            logger.error(f"Error getting chat member count: {e}")
+            # Fallback: set minimum target
+            if 'target_member_count' not in self.active_polls[poll_id]:
+                self.active_polls[poll_id]['target_member_count'] = 1
+
+    async def poll_answer_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle poll answers and vote retractions"""
+        poll_answer = update.poll_answer
+        poll_id = poll_answer.poll_id
+        user_id = poll_answer.user.id
+        current_option_ids = list(poll_answer.option_ids)
+
+        logger.info(f"Poll answer received: poll_id={poll_id}, user_id={user_id}, options={current_option_ids}")
+
+        if poll_id in self.active_polls:
+            # Initialize user vote state tracking for this poll if needed
+            poll_user_key = f"{poll_id}_{user_id}"
+            previous_option_ids = self.user_vote_states.get(poll_user_key, [])
+
+            # Track vote counts manually
+            vote_counts = self.active_polls[poll_id]['vote_counts']
+            options = self.active_polls[poll_id]['options']
+
+            # Handle vote retraction: remove user from previously voted options
+            if previous_option_ids:
+                logger.info(f"User {user_id} had previous votes: {previous_option_ids}")
+                for prev_option_id in previous_option_ids:
+                    if prev_option_id < len(options):
+                        prev_option_text = options[prev_option_id]
+                        if prev_option_text in vote_counts and user_id in vote_counts[prev_option_text]:
+                            vote_counts[prev_option_text].remove(user_id)
+                            logger.info(f"Retracted vote from option {prev_option_id}: '{prev_option_text}'")
+
+                            # Clean up empty vote sets
+                            if not vote_counts[prev_option_text]:
+                                vote_counts[prev_option_text] = set()
+
+            # Handle new votes: add user to newly selected options
+            if current_option_ids:
+                logger.info(f"User {user_id} voting for new options: {current_option_ids}")
+                for option_id in current_option_ids:
+                    if option_id < len(options):
+                        option_text = options[option_id]
+                        if option_text not in vote_counts:
+                            vote_counts[option_text] = set()
+                        vote_counts[option_text].add(user_id)
+                        logger.info(f"Vote added for option {option_id}: '{option_text}'")
+            else:
+                # Complete retraction - user deselected all options
+                if previous_option_ids:
+                    logger.info(f"User {user_id} retracted all votes (was: {previous_option_ids})")
+                else:
+                    logger.info(f"User {user_id} sent empty vote (no previous votes)")
+
+            # Update user's vote state
+            self.user_vote_states[poll_user_key] = current_option_ids
+
+            # Check if user voted only for "Не могу 😔"
+            if len(current_option_ids) == 1:
+                cant_make_it_option_id = None
+                for i, option in enumerate(options):
+                    if option == "Не могу 😔":
+                        cant_make_it_option_id = i
+                        break
+
+                if cant_make_it_option_id is not None and current_option_ids[0] == cant_make_it_option_id:
+                    logger.info(f"User {user_id} voted only for 'Не могу 😔'")
+                    # Store that this user can't make it, but don't process immediately
+                    if 'cant_make_it_users' not in self.active_polls[poll_id]:
+                        self.active_polls[poll_id]['cant_make_it_users'] = set()
+                    self.active_polls[poll_id]['cant_make_it_users'].add(user_id)
+
+            # Update vote count based on unique voters across all options (if poll still exists)
+            if poll_id in self.active_polls:
+                all_voters = set()
+                for voters in vote_counts.values():
+                    all_voters.update(voters)
+                self.active_polls[poll_id]['vote_count'] = len(all_voters)
+
+                logger.info(
+                    f"Poll {poll_id} vote count: {self.active_polls[poll_id]['vote_count']}/{self.active_polls[poll_id].get('target_member_count', 1)}")
+                logger.info(f"Current vote distribution: {vote_counts}")
+
+                # Check if everyone has voted (this will re-evaluate resolution logic)
+                await self.check_if_everyone_voted(poll_id, context)
+            else:
+                logger.info(f"Poll {poll_id} was already resolved and cleaned up")
+        else:
+            logger.warning(f"Received vote for unknown poll {poll_id}")
+
+    #    TODO get everyone from chat
+    async def check_if_everyone_voted(self, poll_id, context):
+        """Check if everyone has voted based on getChatMembersCount"""
+        if poll_id not in self.active_polls:
+            return
+
+        poll_data = self.active_polls[poll_id]
+        vote_count = poll_data['vote_count']
+        target_member_count = poll_data.get('target_member_count', 1)
+        chat_id = poll_data['chat_id']
+
+        # Check if vote count matches target member count
+        if vote_count >= target_member_count and target_member_count > 0:
+            logger.info(f"Everyone voted for poll {poll_id}! Votes: {vote_count}/{target_member_count}")
+
+            # First check if everyone voted only "Не могу"
+            cant_make_it_users = poll_data.get('cant_make_it_users', set())
+
+            # Calculate effective member count (excluding users who can't make it)
+            effective_member_count = target_member_count - len(cant_make_it_users)
+
+            if effective_member_count <= 0:
+                # Everyone voted "Не могу" - send playful message
+                logger.info(f"Everyone voted 'Не могу' for poll {poll_id}")
+                playful_message = "Никто не может прийти на встречу! 😅 Попробуйте создать новый опрос с другими вариантами времени.\n\nИспользуйте /create_poll"
+                await context.bot.send_message(chat_id=chat_id, text=playful_message)
+                await self.close_poll_and_clean_up(poll_id, context)
+                return
+
+            # Check if some users voted only "Не могу" and handle them
+            if cant_make_it_users and effective_member_count > 0:
+                logger.info(f"Processing users who can't make it: {cant_make_it_users}")
+                await self.handle_cant_make_it_users(poll_id, cant_make_it_users, context)
+                return
+
+            try:
+                # Get current time and date
+                now = datetime.now()
+                time_str = now.strftime("%H:%M")
+                date_str = now.strftime("%d.%m.%Y")
+
+                # Get poll results to find the most voted option
+                most_voted_result = await self.get_most_voted_option(poll_id, context)
+
+                # Send confirmation message with the most voted result
+                if most_voted_result:
+                    # Check if everyone can't make it
+                    if most_voted_result == "EVERYONE_CANT_MAKE_IT":
+                        # Send playful message and close poll
+                        playful_message = "Никто не может прийти на встречу! 😅 Попробуйте создать новый опрос с другими вариантами времени.\n\nИспользуйте /create_poll"
+                        await context.bot.send_message(chat_id=chat_id, text=playful_message)
+                        await self.close_poll_and_clean_up(poll_id, context)
+                        return
+                    # Check if revote was prompted
+                    elif most_voted_result == "REVOTE_PROMPTED":
+                        # Don't send confirmation message, users prompted to change votes
+                        logger.info(f"Revote prompted for poll {poll_id}, waiting for vote changes")
+                        return
+                    # Check if "Не могу 😔" won
+                    elif most_voted_result == "Не могу 😔":
+                        confirmation_message = "😔 Большинство не может собраться. Попробуйте создать новый опрос с другими вариантами."
+                        # Don't schedule any follow-up tasks for "Не могу" result
+                        send_only_message = True
+                    else:
+                        confirmation_message = f"Собираемся в {most_voted_result}"
+                        send_only_message = False
+                else:
+                    confirmation_message = f"✅ Все проголосовали! (Не удалось получить результаты)"
+                    send_only_message = True
+
+                sent_message = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=confirmation_message
+                )
+
+                # Only pin and schedule tasks if it's not "Не могу" result
+                if not send_only_message:
+                    # Close the poll to prevent further voting
+                    try:
+                        poll_message_id = poll_data['poll_message_id']
+                        await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                        logger.info(f"Closed poll {poll_id} in chat {chat_id}")
+                    except Exception as e:
+                        logger.warning(f"Could not close poll {poll_id}: {e}")
+
+                    # Pin the confirmation message
+                    try:
+                        await context.bot.pin_chat_message(
+                            chat_id=chat_id,
+                            message_id=sent_message.message_id,
+                            disable_notification=True
+                        )
+                        logger.info(f"Pinned confirmation message in chat {chat_id}")
+
+                        # Store pinned message info for later unpinning
+                        self.pinned_messages[f"{chat_id}_{poll_id}"] = {
+                            'chat_id': chat_id,
+                            'message_id': sent_message.message_id
+                        }
+                    except Exception as e:
+                        logger.warning(f"Could not pin message in chat {chat_id}: {e}")
+
+                    # Get all voters from the poll
+                    poll_voters = set()
+                    if poll_id in self.active_polls:
+                        poll_data = self.active_polls[poll_id]
+                        if 'vote_counts' in poll_data:
+                            # Extract all voters from vote_counts (which contains voters by option)
+                            for option_text, voters in poll_data['vote_counts'].items():
+                                poll_voters.update(voters)
+                            # Exclude bots from voters
+                            try:
+                                bot_info = await context.bot.get_me()
+                                bot_user_id = bot_info.id
+                                poll_voters.discard(bot_user_id)
+                            except Exception as e:
+                                logger.warning(f"Could not get bot info to exclude from voters: {e}")
+
+                    # Schedule immediate confirmation (1 minute after poll is confirmed)
+                    immediate_confirmation_task = asyncio.create_task(
+                        self.schedule_immediate_confirmation(chat_id, most_voted_result, context, poll_voters))
+
+                    # Schedule "В силе?" message for the day before at 18:00
+                    confirmation_task = asyncio.create_task(
+                        self.schedule_confirmation_question(poll_id, chat_id, set(), context, most_voted_result))
+
+                    # Schedule unpinning at the event time
+                    unpin_task = asyncio.create_task(
+                        self.schedule_unpin_message(poll_id, chat_id, context, most_voted_result))
+
+                    # Schedule follow-up message for the day after the meeting
+                    followup_task = asyncio.create_task(
+                        self.schedule_followup_message(chat_id, context, most_voted_result))
+
+                    # Track scheduled tasks for this chat
+                    if chat_id not in self.scheduled_tasks:
+                        self.scheduled_tasks[chat_id] = []
+                    self.scheduled_tasks[chat_id].extend([
+                        {'task': confirmation_task, 'type': 'confirmation', 'poll_id': poll_id},
+                        {'task': unpin_task, 'type': 'unpin', 'poll_id': poll_id},
+                        {'task': followup_task, 'type': 'followup', 'poll_id': poll_id}
+                    ])
+                else:
+                    logger.info(f"Poll {poll_id} result was 'Не могу' or error - no scheduling or pinning")
+
+                # Don't clean up poll data yet - we need it for the confirmation question
+                logger.info(f"Poll {poll_id} completed - everyone voted, scheduling confirmation question")
+
+            except Exception as e:
+                logger.error(f"Error sending confirmation message: {e}")
+        else:
+            logger.info(f"Not everyone voted yet for poll {poll_id}. Votes: {vote_count}/{target_member_count}")
+
+    async def get_most_voted_option(self, poll_id, context):
+        """Get the most voted option from the poll, handling ties intelligently"""
+        try:
+            if poll_id not in self.active_polls:
+                logger.error(f"Poll {poll_id} not found in active polls")
+                return None
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+            message_id = poll_data['poll_message_id']
+
+            logger.info(f"Trying to get poll results for poll {poll_id}, chat {chat_id}, message {message_id}")
+
+            # Skip API call and go directly to fallback with new resolution logic
+            # The API call to get poll results is not reliable, so we'll use our tracked votes
+            logger.info(f"Using tracked votes for poll {poll_id} resolution")
+            return await self.get_most_voted_option_fallback_with_new_logic(poll_id, context)
+
+        except Exception as e:
+            logger.error(f"Error getting poll results for {poll_id}: {e}")
+            logger.error(f"Exception details: {type(e).__name__}: {str(e)}")
+
+            # Final fallback: use manually tracked votes with new logic
+            logger.info("Using final fallback method with new resolution logic")
+            return await self.get_most_voted_option_fallback_with_new_logic(poll_id, context)
+
+    async def analyze_poll_results(self, poll, poll_id):
+        """Analyze poll results with new resolution logic"""
+        if poll_id not in self.active_polls:
+            logger.error(f"Poll {poll_id} not found for analysis")
+            return {'has_tie': False, 'winner': None, 'tied_options': [], 'vote_counts': {}, 'max_votes': 0}
+
+        vote_counts_by_users = self.active_polls[poll_id]['vote_counts']
+        target_member_count = self.active_polls[poll_id].get('target_member_count', 1)
+
+        logger.info(f"Analyzing poll {poll_id} with {target_member_count} target members")
+        logger.info(f"Vote data: {vote_counts_by_users}")
+
+        # Get all voters (union of all vote sets)
+        all_voters = set()
+        for voters in vote_counts_by_users.values():
+            all_voters.update(voters)
+
+        # Count votes for each option
+        vote_counts = {}
+        for option_text, voters in vote_counts_by_users.items():
+            vote_counts[option_text] = len(voters)
+            logger.info(f"Option '{option_text}': {len(voters)} votes")
+
+        # NEW RESOLUTION LOGIC:
+
+        # First, check if everyone has actually voted (total unique voters equals target)
+        all_voters = set()
+        for voters in vote_counts_by_users.values():
+            all_voters.update(voters)
+
+        if len(all_voters) < target_member_count:
+            # Not everyone has voted yet, return no winner
+            logger.info(f"Not everyone voted yet: {len(all_voters)}/{target_member_count} voters")
+            return {
+                'vote_counts': vote_counts,
+                'max_votes': max(vote_counts.values()) if vote_counts else 0,
+                'winner': None,
+                'tied_options': [],
+                'has_tie': False,
+                'voter_data': vote_counts_by_users
+            }
+
+        # Everyone has voted, now apply resolution logic
+        logger.info(f"Everyone has voted ({len(all_voters)}/{target_member_count}), applying resolution logic")
+
+        # Case 1: ✅ Everyone voted one identical option → selected
+        # Find options where everyone voted for ONLY that option (no other options)
+        single_option_everyone = None
+        for option_text, voters in vote_counts_by_users.items():
+            if option_text != "Не могу 😔" and len(voters) == target_member_count:
+                # Check if everyone who voted for this option voted ONLY for this option
+                # by checking if any voter voted for other options too
+                voters_only_this_option = True
+                for voter in voters:
+                    # Check if this voter voted for any other option
+                    for other_option, other_voters in vote_counts_by_users.items():
+                        if other_option != option_text and voter in other_voters:
+                            voters_only_this_option = False
+                            break
+                    if not voters_only_this_option:
+                        break
+
+                if voters_only_this_option:
+                    single_option_everyone = option_text
+                    logger.info(f"Case 1: Everyone voted for single identical option '{option_text}'")
+                    break
+
+        if single_option_everyone:
+            return {
+                'vote_counts': vote_counts,
+                'max_votes': target_member_count,
+                'winner': single_option_everyone,
+                'tied_options': [single_option_everyone],
+                'has_tie': False,
+                'voter_data': vote_counts_by_users
+            }
+
+        # Case 2: ✅ One option is voted by everyone → selected
+        option_voted_by_everyone = None
+        for option_text, voters in vote_counts_by_users.items():
+            if option_text != "Не могу 😔" and len(voters) == target_member_count:
+                option_voted_by_everyone = option_text
+                logger.info(f"Case 2: Option '{option_text}' voted by everyone")
+                break
+
+        if option_voted_by_everyone:
+            return {
+                'vote_counts': vote_counts,
+                'max_votes': target_member_count,
+                'winner': option_voted_by_everyone,
+                'tied_options': [option_voted_by_everyone],
+                'has_tie': False,
+                'voter_data': vote_counts_by_users
+            }
+
+        # Case 4: 🕒 If everyone voted for same multiple options → select earliest date/time
+        # Find options that everyone voted for
+        options_everyone_voted = []
+        for option_text, voters in vote_counts_by_users.items():
+            if option_text != "Не могу 😔" and len(voters) == target_member_count:
+                options_everyone_voted.append(option_text)
+
+        if len(options_everyone_voted) > 1:
+            # Everyone voted for multiple options - select earliest date/time
+            logger.info(f"Case 4: Everyone voted for same multiple options: {options_everyone_voted}")
+            # Sort by the option text to get earliest date/time (assuming format includes date/time)
+            earliest_option = min(options_everyone_voted)
+            logger.info(f"Selected earliest option: '{earliest_option}'")
+            return {
+                'vote_counts': vote_counts,
+                'max_votes': target_member_count,
+                'winner': earliest_option,
+                'tied_options': [earliest_option],
+                'has_tie': False,
+                'voter_data': vote_counts_by_users
+            }
+
+        # Check if everyone voted only "Не могу 😔"
+        cant_make_it_voters = vote_counts_by_users.get("Не могу 😔", set())
+        if len(cant_make_it_voters) == target_member_count:
+            logger.info("Everyone voted only 'Не могу 😔'")
+            return {
+                'vote_counts': vote_counts,
+                'max_votes': target_member_count,
+                'winner': "EVERYONE_CANT_MAKE_IT",
+                'tied_options': ["Не могу 😔"],
+                'has_tie': False,
+                'voter_data': vote_counts_by_users
+            }
+
+        # Case 3: ⚠️ Everyone voted, but no single common option → trigger revote
+        logger.info("Case 3: Everyone voted but no single common option - need revote")
+        return {
+            'vote_counts': vote_counts,
+            'max_votes': max(vote_counts.values()) if vote_counts else 0,
+            'winner': "REVOTE_NEEDED",
+            'tied_options': list(vote_counts.keys()),
+            'has_tie': True,
+            'voter_data': vote_counts_by_users
+        }
+
+    async def handle_tie_situation(self, poll_id, context, vote_analysis):
+        """Handle tie situation by prompting users to change votes on existing poll"""
+        try:
+            if poll_id not in self.active_polls:
+                logger.error(f"Poll {poll_id} not found for tie handling")
+                return None
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+
+            # Send revote notification with a fun, engaging message
+            import random
+            tie_messages = [
+                "Ой, ничья! 🤯 Похоже, наш бот в замешательстве... Помогите ему выбрать — измените голос, если сможете!\n\nПожалуйста, измените свой голос в опросе выше.",
+                "Мы застряли в голосовательной пробке 🚦 Кто-нибудь, поменяйте выбор и спасите встречу!\n\nПожалуйста, измените свой голос в опросе выше.",
+                "Хьюстон, у нас проблема — голоса разделились 🛸 Попробуйте переголосовать, чтобы выйти из тупика!\n\nПожалуйста, измените свой голос в опросе выше.",
+                "Пока ничья 🎲 Это как ничья в шахматах — красиво, но дальше не двинемся. Подскажете путь?\n\nПожалуйста, измените свой голос в опросе выше.",
+                "Бот растерян 🤖 Голоса разделились, и он не знает, что делать. Помогите ему — пересмотрите свой выбор!\n\nПожалуйста, измените свой голос в опросе выше."
+            ]
+            revote_message = random.choice(tie_messages)
+
+            await context.bot.send_message(chat_id=chat_id, text=revote_message)
+
+            # Mark poll as in revote state (don't close it, keep it active)
+            poll_data['in_revote'] = True
+            poll_data['revote_notified'] = True
+
+            logger.info(f"Poll {poll_id} marked for revote - users prompted to change votes")
+
+            # Return special marker to indicate revote prompt was sent
+            return "REVOTE_PROMPTED"
+
+        except Exception as e:
+            logger.error(f"Error handling tie situation: {e}")
+            # Fallback: return None to indicate failure
+            return None
+
+    async def get_most_voted_option_fallback_with_new_logic(self, poll_id, context):
+        """Fallback method using manually tracked votes with new resolution logic"""
+        try:
+            if poll_id not in self.active_polls:
+                logger.error(f"Poll {poll_id} not found in active polls for fallback")
+                return None
+
+            logger.info("Using fallback method with new resolution logic")
+
+            # Create a mock poll object for analyze_poll_results
+            mock_poll = type('MockPoll', (), {'options': []})()
+
+            # Use the new resolution logic
+            vote_analysis = await self.analyze_poll_results(mock_poll, poll_id)
+
+            if vote_analysis['has_tie']:
+                logger.info(f"Fallback: Tie detected for poll {poll_id}")
+                return await self.handle_tie_situation(poll_id, context, vote_analysis)
+            else:
+                logger.info(f"Fallback: Winner '{vote_analysis['winner']}'")
+                return vote_analysis['winner']
+
+        except Exception as e:
+            logger.error(f"Error in fallback method with new logic: {e}")
+            return None
+
+    def get_most_voted_option_fallback(self, poll_id):
+        """Old fallback method - kept for compatibility but should not be used"""
+        logger.warning("Using deprecated fallback method - this should not happen with new logic")
+        try:
+            if poll_id not in self.active_polls:
+                logger.error(f"Poll {poll_id} not found in active polls for fallback")
+                return None
+
+            vote_counts = self.active_polls[poll_id]['vote_counts']
+            logger.info(f"Fallback vote counts: {vote_counts}")
+
+            if not vote_counts:
+                logger.error("No vote counts available in fallback")
+                return None
+
+            # Find option with most votes and detect ties
+            max_votes = -1
+            tied_options = []
+
+            for option_text, voters in vote_counts.items():
+                vote_count = len(voters)
+                logger.info(f"Fallback - Option '{option_text}' has {vote_count} votes")
+                if vote_count > max_votes:
+                    max_votes = vote_count
+                    tied_options = [option_text]
+                elif vote_count == max_votes and vote_count > 0:
+                    tied_options.append(option_text)
+
+            # Check for ties (excluding "Не могу 😔" if there are other options)
+            if len(tied_options) > 1:
+                tied_options_without_cant = [opt for opt in tied_options if opt != "Не могу 😔"]
+                if tied_options_without_cant and len(tied_options_without_cant) > 1:
+                    logger.info(f"Fallback detected tie: {tied_options_without_cant}")
+                    # For fallback, just return the first option (tie handling should be done in main method)
+                    return tied_options_without_cant[0]
+                elif tied_options_without_cant:
+                    return tied_options_without_cant[0]
+
+            most_voted_option = tied_options[0] if tied_options else None
+            logger.info(f"Fallback result - Most voted option: '{most_voted_option}' with {max_votes} votes")
+            return most_voted_option
+
+        except Exception as e:
+            logger.error(f"Error in fallback method: {e}")
+            return None
+
+    async def schedule_confirmation_question(self, poll_id, chat_id, all_members, context, poll_result):
+        """Schedule 'В силе?' confirmation question - day before at 18:00 or 3 hours before if less than 1 day"""
+        try:
+            # Extract date and time from poll result (e.g., "Понедельник (30.12) в 18:00")
+            import re
+            date_match = re.search(r'\((\d{2})\.(\d{2})\)', poll_result)
+            time_match = re.search(r'в (\d{1,2}):(\d{2})', poll_result)
+
+            if not date_match:
+                logger.error(f"Could not extract date from poll result: {poll_result}")
+                return
+
+            day = int(date_match.group(1))
+            month = int(date_match.group(2))
+            current_year = datetime.now().year
+
+            # Extract time if available, default to 12:00 if not found
+            if time_match:
+                hour = int(time_match.group(1))
+                minute = int(time_match.group(2))
+            else:
+                hour = 12
+                minute = 0
+
+            # Create the full meeting datetime in Polish timezone
+            try:
+                from zoneinfo import ZoneInfo
+                polish_tz = ZoneInfo("Europe/Warsaw")
+            except ImportError:
+                # Fallback for older Python versions
+                import pytz
+                polish_tz = pytz.timezone("Europe/Warsaw")
+
+            meeting_datetime = datetime(current_year, month, day, hour, minute, 0, 0, tzinfo=polish_tz)
+            now = datetime.now(polish_tz)
+
+            # Calculate time until meeting
+            time_until_meeting = (meeting_datetime - now).total_seconds()
+            hours_until_meeting = time_until_meeting / 3600
+
+            logger.info(f"Meeting datetime: {meeting_datetime.strftime('%d.%m.%Y %H:%M %Z')} (Polish time)")
+            logger.info(f"Hours until meeting: {hours_until_meeting:.1f}")
+
+            # Determine when to send confirmation
+            if hours_until_meeting > 24:
+                # More than 24 hours - send 24 hours before meeting
+                confirmation_datetime = meeting_datetime - timedelta(hours=24)
+                confirmation_strategy = "24 hours before meeting"
+            elif hours_until_meeting > 3:
+                # Less than 24 hours but more than 3 hours - send 3 hours before
+                confirmation_datetime = meeting_datetime - timedelta(hours=3)
+                confirmation_strategy = "3 hours before meeting"
+            else:
+                # Less than 3 hours - don't send confirmation
+                logger.info(f"Meeting is in {hours_until_meeting:.1f} hours (<3h), skipping confirmation question")
+                return
+
+            # Calculate how long to wait
+            wait_seconds = (confirmation_datetime - now).total_seconds()
+
+            logger.info(f"Confirmation strategy: {confirmation_strategy}")
+            logger.info(f"Confirmation scheduled for: {confirmation_datetime.strftime('%d.%m.%Y %H:%M')}")
+            logger.info(f"Waiting {wait_seconds} seconds ({wait_seconds / 3600:.1f} hours)")
+
+            if wait_seconds <= 0:
+                logger.warning("Confirmation time is in the past, sending immediately")
+                wait_seconds = FALLBACK_WAIT_TIME  # Send in 5 seconds if time is past
+
+            await asyncio.sleep(wait_seconds)
+
+            # Send the confirmation question
+            await self.send_confirmation_question(chat_id, all_members, context, poll_result)
+
+        except Exception as e:
+            logger.error(f"Error scheduling confirmation question: {e}")
+
+    async def schedule_unpin_message(self, poll_id, chat_id, context, poll_result):
+        """Schedule unpinning of confirmation message at the event time"""
+        try:
+            # Extract date and time from poll result (e.g., "Пятница (01.08) в 16:00")
+            import re
+            date_match = re.search(r'\((\d{2})\.(\d{2})\)', poll_result)
+            time_match = re.search(r'в (\d{1,2}):(\d{2})', poll_result)
+
+            if not date_match or not time_match:
+                logger.error(f"Could not extract date/time from poll result: {poll_result}")
+                return
+
+            day = int(date_match.group(1))
+            month = int(date_match.group(2))
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2))
+            current_year = datetime.now().year
+
+            # Create the event datetime
+            event_datetime = datetime(current_year, month, day, hour, minute, 0, 0)
+
+            # Calculate unpin time: 10 hours after event starts
+            unpin_datetime = event_datetime + timedelta(hours=10)
+
+            # Calculate how long to wait
+            now = datetime.now()
+            wait_seconds = (unpin_datetime - now).total_seconds()
+
+            logger.info(f"Event time: {event_datetime.strftime('%d.%m.%Y %H:%M')}")
+            logger.info(f"Unpin scheduled for: {unpin_datetime.strftime('%d.%m.%Y %H:%M')} (10 hours after event)")
+            logger.info(f"Waiting {wait_seconds} seconds ({wait_seconds / 3600:.1f} hours) for unpin")
+
+            if wait_seconds <= 0:
+                logger.warning("Event time is in the past, unpinning immediately")
+                wait_seconds = FALLBACK_WAIT_TIME  # Unpin in 5 seconds if time is past
+
+            await asyncio.sleep(wait_seconds)
+
+            # Unpin the confirmation message
+            await self.unpin_confirmation_message(poll_id, chat_id, context)
+
+        except Exception as e:
+            logger.error(f"Error scheduling unpin message: {e}")
+
+    async def unpin_confirmation_message(self, poll_id, chat_id, context):
+        """Unpin the confirmation message"""
+        try:
+            pin_key = f"{chat_id}_{poll_id}"
+            if pin_key in self.pinned_messages:
+                pinned_info = self.pinned_messages[pin_key]
+
+                await context.bot.unpin_chat_message(
+                    chat_id=pinned_info['chat_id'],
+                    message_id=pinned_info['message_id']
+                )
+
+                logger.info(f"Unpinned confirmation message in chat {chat_id}")
+
+                # Clean up the stored pinned message info
+                del self.pinned_messages[pin_key]
+            else:
+                logger.warning(f"No pinned message found for poll {poll_id} in chat {chat_id}")
+
+        except Exception as e:
+            logger.error(f"Error unpinning confirmation message: {e}")
+
+    async def cancel_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel all scheduled tasks and unpin messages for this chat"""
+        try:
+            chat_id = update.effective_chat.id
+
+            # Cancel all scheduled tasks for this chat
+            cancelled_count = 0
+            if chat_id in self.scheduled_tasks:
+                for task_info in self.scheduled_tasks[chat_id]:
+                    if not task_info['task'].done():
+                        task_info['task'].cancel()
+                        cancelled_count += 1
+                        logger.info(f"Cancelled {task_info['type']} task for poll {task_info['poll_id']}")
+
+                # Clear the tasks list for this chat
+                del self.scheduled_tasks[chat_id]
+
+            # Clear active polls for this chat
+            polls_cleared = 0
+            active_polls_to_remove = []
+            for poll_id, poll_data in self.active_polls.items():
+                if poll_data['chat_id'] == chat_id:
+                    active_polls_to_remove.append(poll_id)
+                    polls_cleared += 1
+
+            for poll_id in active_polls_to_remove:
+                self.cleanup_poll_data(poll_id)
+                del self.active_polls[poll_id]
+                logger.info(f"Cleared active poll {poll_id} for chat {chat_id}")
+
+            # Clear confirmation messages for this chat
+            confirmations_cleared = 0
+            confirmation_keys_to_remove = []
+            for conf_id, conf_data in self.confirmation_messages.items():
+                if conf_data['chat_id'] == chat_id:
+                    confirmation_keys_to_remove.append(conf_id)
+                    confirmations_cleared += 1
+
+            for conf_id in confirmation_keys_to_remove:
+                del self.confirmation_messages[conf_id]
+                logger.info(f"Cleared confirmation {conf_id} for chat {chat_id}")
+
+            # Disable immediate confirmation buttons for this chat
+            disabled_immediate_count = 0
+            immediate_keys_to_remove = []
+            for immediate_id, immediate_data in self.immediate_confirmation_messages.items():
+                if immediate_data['chat_id'] == chat_id:
+                    try:
+                        # Edit message to remove buttons and show cancellation
+                        disabled_text = f"❌ Встреча отменена\n\n{immediate_data['poll_result']}"
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=immediate_data['message_id'],
+                            text=disabled_text
+                        )
+                        disabled_immediate_count += 1
+                        immediate_keys_to_remove.append(immediate_id)
+                        logger.info(
+                            f"Disabled immediate confirmation buttons for message {immediate_data['message_id']} in chat {chat_id}")
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not disable immediate confirmation buttons for message {immediate_data['message_id']}: {e}")
+
+            for immediate_id in immediate_keys_to_remove:
+                del self.immediate_confirmation_messages[immediate_id]
+
+            # Unpin all pinned messages for this chat
+            unpinned_count = 0
+            pinned_keys_to_remove = []
+            for pin_key, pinned_info in self.pinned_messages.items():
+                if pinned_info['chat_id'] == chat_id:
+                    try:
+                        await context.bot.unpin_chat_message(
+                            chat_id=chat_id,
+                            message_id=pinned_info['message_id']
+                        )
+                        unpinned_count += 1
+                        pinned_keys_to_remove.append(pin_key)
+                        logger.info(f"Unpinned message {pinned_info['message_id']} in chat {chat_id}")
+                    except Exception as e:
+                        logger.warning(f"Could not unpin message {pinned_info['message_id']}: {e}")
+
+            # Remove unpinned messages from tracking
+            for pin_key in pinned_keys_to_remove:
+                del self.pinned_messages[pin_key]
+
+            # Send confirmation message
+            response_text = (
+                f"🛑 Бот отменён для этого чата!\n\n"
+                f"📋 Отменено задач: {cancelled_count}\n"
+                f"🗳️ Очищено опросов: {polls_cleared}\n"
+                f"💬 Очищено подтверждений: {confirmations_cleared}\n"
+                f"⏰ Отключено немедленных подтверждений: {disabled_immediate_count}\n"
+                f"📌 Откреплено сообщений: {unpinned_count}\n\n"
+                f"Используйте /create_poll чтобы создать новый опрос."
+            )
+
+            await update.message.reply_text(response_text)
+            logger.info(
+                f"Bot cancelled for chat {chat_id} - {cancelled_count} tasks cancelled, {polls_cleared} polls cleared, {confirmations_cleared} confirmations cleared, {unpinned_count} messages unpinned")
+
+        except Exception as e:
+            logger.error(f"Error cancelling bot: {e}")
+            await update.message.reply_text("❌ Ошибка при отмене бота. Попробуйте ещё раз.")
+
+    async def schedule_followup_message(self, chat_id, context, poll_result):
+        """Schedule follow-up message 72 hours after the meeting"""
+        try:
+            # Extract date and time from poll result (e.g., "Понедельник (30.12) в 18:00")
+            import re
+            from zoneinfo import ZoneInfo
+
+            date_match = re.search(r'\((\d{2})\.(\d{2})\)', poll_result)
+            time_match = re.search(r'в (\d{1,2}):(\d{2})', poll_result)
+
+            if not date_match:
+                logger.error(f"Could not extract date from poll result for follow-up: {poll_result}")
+                return
+
+            day = int(date_match.group(1))
+            month = int(date_match.group(2))
+            current_year = datetime.now().year
+
+            # Extract time if available, default to 12:00 if not found
+            if time_match:
+                hour = int(time_match.group(1))
+                minute = int(time_match.group(2))
+            else:
+                hour = 12
+                minute = 0
+
+            # Create the full meeting datetime in Polish timezone
+            try:
+                polish_tz = ZoneInfo("Europe/Warsaw")
+            except ImportError:
+                # Fallback for older Python versions
+                import pytz
+                polish_tz = pytz.timezone("Europe/Warsaw")
+
+            meeting_datetime = datetime(current_year, month, day, hour, minute, 0, 0, tzinfo=polish_tz)
+
+            # Calculate 72 hours (3 days) after the meeting
+            followup_datetime = meeting_datetime + timedelta(hours=72)
+
+            # Calculate how long to wait
+            now = datetime.now(polish_tz)
+            wait_seconds = (followup_datetime - now).total_seconds()
+
+            logger.info(f"Meeting at: {meeting_datetime.strftime('%d.%m.%Y %H:%M %Z')} (Polish time)")
+            logger.info(
+                f"Follow-up scheduled for: {followup_datetime.strftime('%d.%m.%Y %H:%M %Z')} (72 hours after meeting)")
+            logger.info(f"Waiting {wait_seconds} seconds ({wait_seconds / 3600:.1f} hours) for follow-up")
+
+            if wait_seconds <= 0:
+                logger.warning("Follow-up time is in the past, sending immediately")
+                wait_seconds = FALLBACK_WAIT_TIME  # Send in 5 seconds if time is past
+
+            await asyncio.sleep(wait_seconds)
+
+            # Send the follow-up message
+            await self.send_followup_message(chat_id, context)
+
+        except Exception as e:
+            logger.error(f"Error scheduling follow-up message: {e}")
+
+    async def send_followup_message(self, chat_id, context):
+        """Send follow-up message suggesting to create another poll"""
+        try:
+            followup_text = (
+                "🔄 Как прошла встреча? Готовы планировать следующую?\n\n"
+                "Используйте /create_poll чтобы создать новый опрос для следующей встречи!"
+            )
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=followup_text
+            )
+
+            logger.info(f"Sent follow-up message to chat {chat_id}")
+
+        except Exception as e:
+            logger.error(f"Error sending follow-up message: {e}")
+
+    async def schedule_immediate_confirmation(self, chat_id, poll_result, context, poll_voters=None):
+        """Schedule immediate confirmation message 1 minute after poll is confirmed"""
+        try:
+            logger.info(
+                f"Scheduling immediate confirmation for chat {chat_id} in {IMMEDIATE_CONFIRMATION_DELAY} seconds")
+            await asyncio.sleep(IMMEDIATE_CONFIRMATION_DELAY)
+
+            # Send the immediate confirmation message
+            await self.send_immediate_confirmation_message(chat_id, poll_result, context, poll_voters)
+
+        except Exception as e:
+            logger.error(f"Error scheduling immediate confirmation: {e}")
+
+    async def send_immediate_confirmation_message(self, chat_id, poll_result, context, poll_voters=None):
+        """Send immediate confirmation message with inline keyboard buttons"""
+        try:
+            confirmation_text = f"План в силе? 💪 {poll_result}"
+
+            # Create inline keyboard for confirmation
+            keyboard = [
+                [
+                    InlineKeyboardButton("👍 Да, продолжаем!",
+                                         callback_data=f"proceed_yes_{chat_id}_{int(time.time())}"),
+                    InlineKeyboardButton("❌ Нет, отменить", callback_data=f"proceed_no_{chat_id}_{int(time.time())}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Send the confirmation message with inline keyboard
+            message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=confirmation_text,
+                reply_markup=reply_markup
+            )
+
+            # Store immediate confirmation message info for later management
+            immediate_conf_id = f"immediate_{chat_id}_{message.message_id}"
+            if not hasattr(self, 'immediate_confirmation_messages'):
+                self.immediate_confirmation_messages = {}
+
+            self.immediate_confirmation_messages[immediate_conf_id] = {
+                'chat_id': chat_id,
+                'message_id': message.message_id,
+                'poll_result': poll_result,
+                'context': context,
+                'confirmed_users': set(),  # Users who confirmed "yes"
+                'declined_users': set(),  # Users who declined "no"
+                'all_voters': poll_voters or set()  # All users who voted in the original poll
+            }
+
+            logger.info(
+                f"Sent immediate confirmation with inline keyboard: '{confirmation_text}' (ID: {immediate_conf_id})")
+
+        except Exception as e:
+            logger.error(f"Error sending immediate confirmation message: {e}")
+
+    async def send_confirmation_question(self, chat_id, all_members, context, poll_result):
+        """Send 'В силе?' confirmation question"""
+        try:
+            confirmation_text = f"План в силе? 💪 Отреагируйте👍 если идете! {poll_result}"
+
+            # Send the confirmation message
+            message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=confirmation_text
+            )
+
+            # Track this confirmation message (simplified - no member tracking)
+            confirmation_id = f"{chat_id}_{message.message_id}"
+            self.confirmation_messages[confirmation_id] = {
+                'chat_id': chat_id,
+                'message_id': message.message_id,
+                'reactors': set(),
+                'context': context
+            }
+
+            logger.info(f"Sent confirmation question: '{confirmation_text}' with ID {confirmation_id}")
+
+            # Start monitoring reactions for 1 hour
+            asyncio.create_task(self.monitor_confirmation_reactions(confirmation_id))
+
+            logger.info(f"Sent confirmation question and started 1-hour monitoring")
+
+        except Exception as e:
+            logger.error(f"Error sending confirmation question: {e}")
+
+    async def monitor_confirmation_reactions(self, confirmation_id):
+        """Monitor reactions to confirmation message for 1 hour"""
+        try:
+            await asyncio.sleep(CONFIRMATION_REACTION_TIMEOUT)  # Wait 1 hour for reactions
+
+            if confirmation_id not in self.confirmation_messages:
+                logger.info(f"Confirmation {confirmation_id} was already cleaned up")
+                return
+
+            conf_data = self.confirmation_messages[confirmation_id]
+            reactors = conf_data['reactors']
+            chat_id = conf_data['chat_id']
+            context = conf_data['context']
+
+            logger.info(f"Confirmation {confirmation_id} timeout. Reactors: {len(reactors)}")
+
+            # Send general reminder since we don't track specific members
+            ping_message = "⏰ Время истекло! Отреагируйте на сообщение выше, пожалуйста!"
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=ping_message
+                )
+                logger.info(f"Sent general reaction reminder for confirmation {confirmation_id}")
+            except Exception as e:
+                logger.error(f"Error sending reaction reminder: {e}")
+
+            # Clean up confirmation data
+            if confirmation_id in self.confirmation_messages:
+                del self.confirmation_messages[confirmation_id]
+                logger.info(f"Cleaned up confirmation {confirmation_id} data")
+
+        except Exception as e:
+            logger.error(f"Error monitoring confirmation reactions: {e}")
+
+    async def message_reaction_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle message reactions"""
+        try:
+            reaction_update = update.message_reaction
+            chat_id = reaction_update.chat.id
+            message_id = reaction_update.message_id
+            user_id = reaction_update.user.id
+
+            confirmation_id = f"{chat_id}_{message_id}"
+
+            logger.info(f"Reaction received: chat_id={chat_id}, message_id={message_id}, user_id={user_id}")
+
+            # Check if this is a thumbs up reaction for proceed confirmation
+            for poll_id, poll_data in self.active_polls.items():
+                proceed_data = poll_data.get('proceed_confirmation')
+                if proceed_data and proceed_data['message_id'] == message_id:
+                    # Check if it's a thumbs up reaction
+                    new_reactions = reaction_update.new_reaction
+                    if new_reactions:
+                        for reaction in new_reactions:
+                            if hasattr(reaction, 'emoji') and reaction.emoji == '👍':
+                                proceed_data['thumbs_up_users'].add(user_id)
+                                logger.info(f"Added thumbs up from user {user_id} for poll {poll_id}")
+
+                                # Check if we have enough reactions now
+                                await self.check_thumbs_up_threshold(poll_id)
+                                return
+
+            # Handle regular confirmation reactions (for "В силе?" messages)
+            if confirmation_id in self.confirmation_messages:
+                # Add user to reactors
+                self.confirmation_messages[confirmation_id]['reactors'].add(user_id)
+                logger.info(f"Added user {user_id} to reactors for confirmation {confirmation_id}")
+                logger.info(f"Current reactors: {self.confirmation_messages[confirmation_id]['reactors']}")
+
+                # Check if everyone reacted
+                await self.check_if_everyone_reacted(confirmation_id)
+            else:
+                logger.info(f"Reaction to unknown confirmation message {confirmation_id}")
+
+        except Exception as e:
+            logger.error(f"Error handling message reaction: {e}")
+
+    async def check_if_everyone_reacted(self, confirmation_id):
+        """Check reactions to the confirmation message"""
+        try:
+            if confirmation_id not in self.confirmation_messages:
+                return
+
+            conf_data = self.confirmation_messages[confirmation_id]
+            reactors = conf_data['reactors']
+            chat_id = conf_data['chat_id']
+            context = conf_data['context']
+
+            # Just log the reaction count (no automatic completion since we don't track member count)
+            logger.info(f"Reaction received for confirmation {confirmation_id}. Total reactors: {len(reactors)}")
+
+        except Exception as e:
+            logger.error(f"Error checking reactions: {e}")
+
+    async def monitor_poll_voting(self, poll_id):
+        """Monitor poll voting for 1 hour and ping non-voters"""
+        logger.info(f"Starting 1-hour countdown for poll {poll_id}")
+        await asyncio.sleep(POLL_VOTING_TIMEOUT)  # Wait 1 hour
+
+        if poll_id not in self.active_polls:
+            logger.info(f"Poll {poll_id} was already cleaned up")
+            return  # Poll was already cleaned up
+
+        poll_data = self.active_polls[poll_id]
+        vote_count = poll_data['vote_count']
+        target_member_count = poll_data.get('target_member_count', 1)
+        chat_id = poll_data['chat_id']
+        context = poll_data['context']
+
+        logger.info(f"Poll {poll_id} timeout reached. Target members: {target_member_count}, Votes: {vote_count}")
+
+        # Send general reminder if not enough votes
+        if vote_count < target_member_count:
+            # Send general reminder message
+            missing_votes = target_member_count - vote_count
+            ping_message = f"⏰ Ещё {missing_votes} человек не проголосовали. Проголосуйте, пожалуйста!"
+
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=ping_message
+                )
+                logger.info(f"Sent general reminder for poll {poll_id}: {missing_votes} votes missing")
+            except Exception as e:
+                logger.error(f"Error sending reminder message: {e}")
+
+            # Mark that reminder was sent but keep poll active
+            self.active_polls[poll_id]['reminder_sent'] = True
+            logger.info(f"Poll {poll_id} reminder sent, poll remains active for more votes")
+        else:
+            # Everyone has voted, proceed with poll resolution
+            logger.info(f"Poll {poll_id} - everyone voted after 1 hour, proceeding with resolution")
+            await self.check_if_everyone_voted(poll_id, context)
+
+    async def cleanup_expired_sessions(self):
+        """Periodically clean up expired sessions"""
+        while True:
+            try:
+                current_time = datetime.now()
+                expired_sessions = []
+
+                for chat_id, chat_sessions in list(self.sessions.items()):
+                    for user_id, session in list(chat_sessions.items()):
+                        last_activity = session.get('last_activity', session.get('created_at', current_time))
+                        time_since_activity = (current_time - last_activity).total_seconds()
+
+                        if time_since_activity > self.session_timeout:
+                            expired_sessions.append((chat_id, user_id))
+                            logger.info(
+                                f"Session for user {user_id} in chat {chat_id} expired after {time_since_activity / 3600:.1f} hours")
+
+                # Remove expired sessions
+                for chat_id, user_id in expired_sessions:
+                    if chat_id in self.sessions and user_id in self.sessions[chat_id]:
+                        del self.sessions[chat_id][user_id]
+                        if not self.sessions[chat_id]:  # Remove empty chat session
+                            del self.sessions[chat_id]
+                        logger.info(f"Cleaned up expired session for user {user_id} in chat {chat_id}")
+
+                if expired_sessions:
+                    logger.info(f"Cleaned up {len(expired_sessions)} expired sessions")
+
+                # Sleep for 1 hour before next cleanup
+                await asyncio.sleep(CLEANUP_INTERVAL)
+
+            except Exception as e:
+                logger.error(f"Error in session cleanup: {e}")
+                await asyncio.sleep(CLEANUP_INTERVAL)  # Continue cleanup even if there's an error
+
+    def is_session_valid(self, chat_id, user_id):
+        """Check if a session is still valid"""
+        if chat_id not in self.sessions or user_id not in self.sessions[chat_id]:
+            return False
+
+        session = self.sessions[chat_id][user_id]
+        current_time = datetime.now()
+        last_activity = session.get('last_activity', session.get('created_at', current_time))
+        time_since_activity = (current_time - last_activity).total_seconds()
+
+        return time_since_activity <= self.session_timeout
+
+    def cleanup_poll_data(self, poll_id):
+        """Clean up all data associated with a poll, including user vote states"""
+        # Clean up user vote states for this poll
+        vote_state_keys_to_remove = []
+        for key in self.user_vote_states.keys():
+            if key.startswith(f"{poll_id}_"):
+                vote_state_keys_to_remove.append(key)
+
+        for key in vote_state_keys_to_remove:
+            del self.user_vote_states[key]
+
+        if vote_state_keys_to_remove:
+            logger.info(f"Cleaned up {len(vote_state_keys_to_remove)} user vote states for poll {poll_id}")
+
+    async def handle_cant_make_it_vote(self, poll_id, user_id, context):
+        """Handle when a user votes only for 'Не могу 😔'"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+            vote_counts = poll_data['vote_counts']
+            target_member_count = poll_data.get('target_member_count', 1)
+
+            # Get user info to format username
+            try:
+                user_info = await context.bot.get_chat_member(chat_id, user_id)
+                user = user_info.user
+                if user.username:
+                    user_mention = f"@{user.username}"
+                else:
+                    # Fallback to first name if no username
+                    user_mention = f"[{user.first_name}](tg://user?id={user_id})"
+                    parse_mode = 'Markdown'
+            except:
+                # Fallback to user ID if can't get user info
+                user_mention = f"[{user_id}](tg://user?id={user_id})"
+                parse_mode = 'Markdown'
+
+            # Send notification about user not being able to attend
+            cant_make_it_message = f"{user_mention} не сможет присоединиться к встрече"
+            if user_mention.startswith('@'):
+                await context.bot.send_message(chat_id=chat_id, text=cant_make_it_message)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=cant_make_it_message, parse_mode='Markdown')
+
+            # Check if everyone has voted
+            all_voters = set()
+            for voters in vote_counts.values():
+                all_voters.update(voters)
+
+            if len(all_voters) >= target_member_count:
+                # Everyone has voted, ask if we should ignore this user and proceed
+                logger.info(f"Everyone voted, asking if should ignore user {user_id} and proceed")
+                await self.ask_ignore_user_and_proceed(poll_id, user_id, context)
+
+        except Exception as e:
+            logger.error(f"Error handling 'Не могу' vote: {e}")
+
+    async def handle_cant_make_it_users(self, poll_id, cant_make_it_users, context):
+        """Handle users who voted only 'Не могу' after everyone has voted"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+
+            # Send notification for each user who can't make it
+            for user_id in cant_make_it_users:
+                # Get user info to format username
+                try:
+                    user_info = await context.bot.get_chat_member(chat_id, user_id)
+                    user = user_info.user
+                    if user.username:
+                        user_mention = f"@{user.username}"
+                    else:
+                        # Fallback to first name if no username
+                        user_mention = f"[{user.first_name}](tg://user?id={user_id})"
+                        parse_mode = 'Markdown'
+                except:
+                    # Fallback to user ID if can't get user info
+                    user_mention = f"[{user_id}](tg://user?id={user_id})"
+                    parse_mode = 'Markdown'
+
+                # Send notification about user not being able to attend
+                cant_make_it_message = f"{user_mention} не сможет присоединиться к встрече"
+                if user_mention.startswith('@'):
+                    await context.bot.send_message(chat_id=chat_id, text=cant_make_it_message)
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text=cant_make_it_message, parse_mode='Markdown')
+
+            # Now ask if we should proceed without these users using thumbs up reactions
+            await self.ask_proceed_with_thumbs_up(poll_id, cant_make_it_users, context)
+
+        except Exception as e:
+            logger.error(f"Error handling can't make it users: {e}")
+
+    async def ask_proceed_with_thumbs_up(self, poll_id, cant_make_it_users, context):
+        """Ask if we should proceed without users who can't make it using thumbs up reactions"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+
+            # Create message asking to proceed
+            if len(cant_make_it_users) == 1:
+                user_id = next(iter(cant_make_it_users))
+                # Get user mention
+                try:
+                    user_info = await context.bot.get_chat_member(chat_id, user_id)
+                    user = user_info.user
+                    if user.username:
+                        user_mention = f"@{user.username}"
+                    else:
+                        user_mention = user.first_name
+                except:
+                    user_mention = f"пользователь {user_id}"
+
+                proceed_message = f"Продолжаем без {user_mention}?"
+            else:
+                user_count = len(cant_make_it_users)
+                proceed_message = f"Продолжаем без {user_count} пользователей?"
+
+            # Create inline keyboard for confirmation
+            keyboard = [
+                [
+                    InlineKeyboardButton("👍 Да, продолжаем!", callback_data=f"proceed_yes_{poll_id}"),
+                    InlineKeyboardButton("❌ Нет, отменить", callback_data=f"proceed_no_{poll_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Send message with inline keyboard
+            proceed_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=proceed_message,
+                reply_markup=reply_markup
+            )
+
+            # Calculate how many users need to respond (excluding can't make it users)
+            target_member_count = poll_data.get('target_member_count', 1)
+            users_who_can_attend = target_member_count - len(cant_make_it_users)
+
+            # Store proceed confirmation data
+            poll_data['proceed_confirmation'] = {
+                'message_id': proceed_msg.message_id,
+                'cant_make_it_users': cant_make_it_users,
+                'yes_votes': set(),
+                'no_votes': set(),
+                'required_responses': users_who_can_attend,
+                'start_time': datetime.now()
+            }
+
+            # Buttons remain available indefinitely (no timeout)
+
+            logger.info(f"Asked for thumbs up confirmation for poll {poll_id}")
+
+        except Exception as e:
+            logger.error(f"Error asking thumbs up confirmation: {e}")
+
+    async def monitor_proceed_timeout(self, poll_id, timeout_seconds):
+        """Monitor proceed confirmation timeout"""
+        try:
+            await asyncio.sleep(timeout_seconds)
+
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            proceed_data = poll_data.get('proceed_confirmation')
+
+            if not proceed_data:
+                return
+
+            chat_id = poll_data['chat_id']
+
+            # Timeout reached without confirmation - cancel meeting
+            logger.info(f"Cancelling poll {poll_id} - timeout reached without confirmation")
+
+            playful_cancellations = [
+                "😅 Никто не подтвердил... Видимо, встреча отменяется! Может, в следующий раз повезёт больше?",
+                "🤷‍♂️ Тишина... Похоже, все передумали встречаться! Ну что ж, бывает.",
+                "😴 Все заснули? Никто не ответил, так что встреча отменяется. Спокойной ночи!",
+                "🦗 Слышу только сверчков... Встреча отменена за неимением энтузиазма!",
+                "🎭 Драма! Никто не хочет встречаться. Занавес опускается, встреча отменена!"
+            ]
+
+            import random
+            cancel_message = random.choice(playful_cancellations)
+            await poll_data['context'].bot.send_message(
+                chat_id=chat_id,
+                text=cancel_message
+            )
+
+            # Close poll and clean up
+            await self.close_poll_and_suggest_new(poll_id, poll_data['context'])
+
+            # Clean up proceed confirmation data
+            if 'proceed_confirmation' in poll_data:
+                del poll_data['proceed_confirmation']
+
+        except Exception as e:
+            logger.error(f"Error monitoring proceed timeout: {e}")
+
+    async def check_thumbs_up_threshold(self, poll_id):
+        """Check if enough thumbs up reactions have been received"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            proceed_data = poll_data.get('proceed_confirmation')
+
+            if not proceed_data:
+                return
+
+            chat_id = poll_data['chat_id']
+            cant_make_it_users = proceed_data['cant_make_it_users']
+            target_member_count = poll_data.get('target_member_count', 1)
+            thumbs_up_users = proceed_data['thumbs_up_users']
+
+            # Calculate how many users need to react (excluding can't make it users and the bot itself)
+            users_who_can_attend = target_member_count - len(cant_make_it_users)
+
+            # Get bot's own user ID to exclude it from reaction requirements
+            try:
+                bot_info = await poll_data['context'].bot.get_me()
+                bot_user_id = bot_info.id
+
+                # Check if bot is counted in the target member count and adjust
+                all_voters = set()
+                for voters in poll_data['vote_counts'].values():
+                    all_voters.update(voters)
+
+                if bot_user_id in all_voters:
+                    users_who_can_attend -= 1
+                    logger.info(f"Bot {bot_user_id} excluded from reaction requirements")
+
+            except Exception as e:
+                logger.warning(f"Could not get bot info: {e}")
+
+            # Ensure we don't require negative reactions
+            users_who_can_attend = max(0, users_who_can_attend)
+
+            logger.info(
+                f"Poll {poll_id}: {len(thumbs_up_users)} thumbs up, need {users_who_can_attend} from users who can attend")
+
+            if len(thumbs_up_users) >= users_who_can_attend:
+                # Enough thumbs up - proceed with resolution
+                logger.info(f"Proceeding with poll {poll_id} - {len(thumbs_up_users)} thumbs up received")
+
+                proceed_message = f"👍 Получено {len(thumbs_up_users)} одобрений! Планируем встречу для остальных."
+                await poll_data['context'].bot.send_message(
+                    chat_id=chat_id,
+                    text=proceed_message
+                )
+
+                # Proceed with resolution excluding can't make it users
+                await self.resolve_poll_excluding_cant_make_it(poll_id, poll_data['context'])
+
+                # Clean up proceed confirmation data
+                if 'proceed_confirmation' in poll_data:
+                    del poll_data['proceed_confirmation']
+
+        except Exception as e:
+            logger.error(f"Error checking thumbs up threshold: {e}")
+
+    async def handle_proceed_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+        """Handle proceed confirmation buttons"""
+        query = update.callback_query
+        user_id = update.effective_user.id
+
+        # Extract action and identifier from callback data
+        parts = data.split('_')
+        action = parts[1]  # 'yes' or 'no'
+
+        # Check if this is an immediate confirmation (has timestamp) or regular proceed (has poll_id)
+        if len(parts) >= 4 and parts[3].isdigit():
+            # This is an immediate confirmation: proceed_yes_chatid_timestamp or proceed_no_chatid_timestamp
+            chat_id = int(parts[2])
+            timestamp = parts[3]
+            await self.handle_immediate_confirmation_button(action, chat_id, user_id, query, context)
+        else:
+            # This is a regular proceed button: proceed_yes_pollid or proceed_no_pollid
+            poll_id = '_'.join(parts[2:])  # rest is poll_id
+            if action == 'yes':
+                await self.handle_proceed_yes(poll_id, user_id, query, context)
+            else:
+                await self.handle_proceed_no(poll_id, user_id, query, context)
+
+    async def handle_immediate_confirmation_button(self, action, chat_id, user_id, query, context):
+        """Handle immediate confirmation buttons (yes/no for 'План в силе?')"""
+        try:
+            user_mention = f"@{query.from_user.username}" if query.from_user.username else f"[{query.from_user.first_name}](tg://user?id={user_id})"
+
+            # Find the immediate confirmation message for this chat
+            immediate_conf_data = None
+            immediate_conf_id = None
+            for conf_id, conf_data in self.immediate_confirmation_messages.items():
+                if conf_data['chat_id'] == chat_id and conf_data['message_id'] == query.message.message_id:
+                    immediate_conf_data = conf_data
+                    immediate_conf_id = conf_id
+                    break
+
+            if not immediate_conf_data:
+                await query.answer("❌ Подтверждение не найдено.", show_alert=True)
+                return
+
+            # Check if user already voted
+            if user_id in immediate_conf_data['confirmed_users'] or user_id in immediate_conf_data['declined_users']:
+                await query.answer("Вы уже проголосовали!", show_alert=True)
+                return
+
+            # Track the user's vote
+            if action == 'yes':
+                immediate_conf_data['confirmed_users'].add(user_id)
+                # User confirmed they are going - send separate message
+                response_text = f"✅ {user_mention} подтвердил участие!"
+                logger.info(f"User {user_id} confirmed attendance for immediate confirmation in chat {chat_id}")
+            else:
+                immediate_conf_data['declined_users'].add(user_id)
+                # User won't be able to join - send separate message
+                response_text = f"{user_mention} не сможет присоединиться к встрече. Вы можете отменить встречу командой /cancel_bot"
+                logger.info(f"User {user_id} won't be able to join for immediate confirmation in chat {chat_id}")
+
+            # Send response message
+            if user_mention.startswith('@'):
+                await context.bot.send_message(chat_id=chat_id, text=response_text)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=response_text, parse_mode='Markdown')
+
+            # Update the message to show disabled buttons for this user
+            await self.update_immediate_confirmation_buttons(immediate_conf_id, user_id, context)
+
+            # Check if everyone who voted in the original poll has confirmed "yes"
+            await self.check_if_everyone_confirmed(immediate_conf_id, context)
+
+            # Just answer the callback to acknowledge the button press
+            await query.answer()
+
+        except Exception as e:
+            logger.error(f"Error handling immediate confirmation button: {e}")
+            await query.answer("❌ Произошла ошибка при обработке ответа.", show_alert=True)
+
+    async def update_immediate_confirmation_buttons(self, immediate_conf_id, voted_user_id, context):
+        """Update immediate confirmation message to show user-specific button states"""
+        try:
+            conf_data = self.immediate_confirmation_messages[immediate_conf_id]
+            chat_id = conf_data['chat_id']
+            message_id = conf_data['message_id']
+
+            # For now, we'll keep the same buttons for everyone since Telegram doesn't support per-user buttons
+            # The duplicate vote prevention is handled in the button handler
+            # This function is a placeholder for future enhancements
+
+            logger.info(f"User {voted_user_id} vote tracked for immediate confirmation {immediate_conf_id}")
+
+        except Exception as e:
+            logger.error(f"Error updating immediate confirmation buttons: {e}")
+
+    async def check_if_everyone_confirmed(self, immediate_conf_id, context):
+        """Check if everyone who voted in the original poll has confirmed 'yes'"""
+        try:
+            conf_data = self.immediate_confirmation_messages[immediate_conf_id]
+            chat_id = conf_data['chat_id']
+            all_voters = conf_data['all_voters']
+            confirmed_users = conf_data['confirmed_users']
+            declined_users = conf_data['declined_users']
+
+            # If no voters data available, skip the check
+            if not all_voters:
+                logger.info(f"No voter data available for immediate confirmation {immediate_conf_id}")
+                return
+
+            # Check if everyone who voted has confirmed "yes"
+            if all_voters.issubset(confirmed_users):
+                # Everyone confirmed! Send playful message
+                playful_messages = [
+                    "🎉 Все подтвердили участие! Встреча состоится! 💪",
+                    "✨ Отлично! Все готовы к встрече! 🚀",
+                    "🔥 Все на месте! Встреча будет огонь! 🎯",
+                    "💯 Все подтвердили! Ждём крутую встречу! ⭐",
+                    "🎊 Все в деле! Встреча обещает быть продуктивной! 🎪"
+                ]
+
+                import random
+                playful_message = random.choice(playful_messages)
+
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=playful_message
+                )
+
+                logger.info(f"Everyone confirmed for immediate confirmation {immediate_conf_id}")
+
+        except Exception as e:
+            logger.error(f"Error checking if everyone confirmed: {e}")
+
+    async def handle_proceed_yes(self, poll_id, user_id, query, context):
+        """Handle proceed yes button"""
+        try:
+            if poll_id not in self.active_polls:
+                await query.edit_message_text("❌ Опрос не найден.")
+                return
+
+            poll_data = self.active_polls[poll_id]
+            proceed_data = poll_data.get('proceed_confirmation')
+
+            if not proceed_data:
+                await query.edit_message_text("❌ Подтверждение не найдено.")
+                return
+
+            # Check if user can vote (not in can't make it list)
+            cant_make_it_users = proceed_data['cant_make_it_users']
+            if user_id in cant_make_it_users:
+                await query.answer("Вы не можете голосовать, так как не сможете присоединиться к встрече",
+                                   show_alert=True)
+                return
+
+            # Add user's yes vote
+            proceed_data['yes_votes'].add(user_id)
+            proceed_data['no_votes'].discard(user_id)  # Remove from no votes if previously voted no
+
+            logger.info(f"User {user_id} voted YES for poll {poll_id}")
+
+            # Check if we have enough responses to make a decision
+            await self.check_proceed_consensus(poll_id, query, context)
+
+        except Exception as e:
+            logger.error(f"Error handling proceed yes: {e}")
+            await query.edit_message_text("❌ Произошла ошибка при обработке подтверждения.")
+
+    async def handle_proceed_no(self, poll_id, user_id, query, context):
+        """Handle proceed no button"""
+        try:
+            if poll_id not in self.active_polls:
+                await query.edit_message_text("❌ Опрос не найден.")
+                return
+
+            poll_data = self.active_polls[poll_id]
+            proceed_data = poll_data.get('proceed_confirmation')
+
+            if not proceed_data:
+                await query.edit_message_text("❌ Подтверждение не найдено.")
+                return
+
+            # Check if user can vote (not in can't make it list)
+            cant_make_it_users = proceed_data['cant_make_it_users']
+            if user_id in cant_make_it_users:
+                await query.answer("Вы не можете голосовать, так как не сможете присоединиться к встрече",
+                                   show_alert=True)
+                return
+
+            # Add user's no vote
+            proceed_data['no_votes'].add(user_id)
+            proceed_data['yes_votes'].discard(user_id)  # Remove from yes votes if previously voted yes
+
+            logger.info(f"User {user_id} voted NO for poll {poll_id}")
+
+            # Check if we have enough responses to make a decision
+            await self.check_proceed_consensus(poll_id, query, context)
+
+        except Exception as e:
+            logger.error(f"Error handling proceed no: {e}")
+            await query.edit_message_text("❌ Произошла ошибка при обработке подтверждения.")
+
+    async def check_proceed_consensus(self, poll_id, query, context):
+        """Check if enough users have voted to make a decision"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            proceed_data = poll_data.get('proceed_confirmation')
+
+            if not proceed_data:
+                return
+
+            yes_votes = proceed_data['yes_votes']
+            no_votes = proceed_data['no_votes']
+            required_responses = proceed_data['required_responses']
+            total_responses = len(yes_votes) + len(no_votes)
+
+            logger.info(
+                f"Poll {poll_id}: {len(yes_votes)} yes, {len(no_votes)} no, {total_responses}/{required_responses} total responses")
+
+            # Update the message to show current vote status
+            status_message = f"Продолжаем без пользователей, которые не могут прийти?\n\n👍 Да: {len(yes_votes)}\n❌ Нет: {len(no_votes)}\n\nОтветили: {total_responses}/{required_responses}"
+
+            if total_responses >= required_responses:
+                # Everyone has responded - make decision based on votes
+                if len(no_votes) > 0:
+                    # If at least one person voted No - cancel
+                    cancel_message = f"❌ Есть голоса против продолжения. Встреча отменена.\n\nПопробуйте создать новый опрос с другими вариантами времени.\n\nИспользуйте /create_poll"
+                    await query.edit_message_text(cancel_message)
+
+                    # Close poll and clean up
+                    await self.close_poll_and_clean_up(poll_id, context)
+                else:
+                    # Everyone voted Yes (no_votes is 0)
+                    proceed_message = f"👍 Все за продолжение! Планируем встречу для остальных."
+                    await query.edit_message_text(proceed_message)
+
+                    # Proceed with resolution excluding can't make it users
+                    await self.resolve_poll_excluding_cant_make_it(poll_id, context)
+
+                # Clean up proceed confirmation data
+                if 'proceed_confirmation' in poll_data:
+                    del poll_data['proceed_confirmation']
+            else:
+                # Not everyone has responded yet - update status
+                await query.edit_message_text(status_message)
+
+        except Exception as e:
+            logger.error(f"Error checking proceed consensus: {e}")
+
+    async def handle_proceed_confirmation(self, query, poll_id, should_proceed, context):
+        """Handle proceed confirmation button click"""
+        try:
+            await query.answer()
+
+            if poll_id not in self.active_polls:
+                await query.edit_message_text("❌ Опрос не найден.")
+                return
+
+            poll_data = self.active_polls[poll_id]
+            proceed_data = poll_data.get('proceed_confirmation')
+
+            if not proceed_data:
+                await query.edit_message_text("❌ Подтверждение не найдено.")
+                return
+
+            user_id = query.from_user.id
+            chat_id = poll_data['chat_id']
+
+            if should_proceed:
+                # User clicked "Yes" - proceed with meeting
+                logger.info(f"User {user_id} confirmed proceeding with poll {poll_id}")
+
+                proceed_message = f"👍 Получено подтверждение! Планируем встречу для остальных."
+                await query.edit_message_text(proceed_message)
+
+                # Proceed with resolution excluding can't make it users
+                await self.resolve_poll_excluding_cant_make_it(poll_id, context)
+            else:
+                # User clicked "No" - cancel meeting
+                logger.info(f"User {user_id} cancelled proceeding with poll {poll_id}")
+
+                cancel_message = "❌ Встреча отменена. Попробуйте создать новый опрос с другими вариантами времени.\n\nИспользуйте /create_poll"
+                await query.edit_message_text(cancel_message)
+
+                # Close poll and clean up
+                await self.close_poll_and_clean_up(poll_id, context)
+
+            # Clean up proceed confirmation data
+            if 'proceed_confirmation' in poll_data:
+                del poll_data['proceed_confirmation']
+
+        except Exception as e:
+            logger.error(f"Error handling proceed confirmation: {e}")
+            await query.edit_message_text("❌ Произошла ошибка при обработке подтверждения.")
+
+    async def ask_ignore_multiple_users_and_proceed(self, poll_id, cant_make_it_users, context):
+        """Ask if we should ignore multiple users who can't make it and proceed with resolution"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+
+            # Ask for confirmation to proceed without the users who can't make it
+            user_count = len(cant_make_it_users)
+            confirmation_message = f"Игнорировать {user_count} пользователей и запланировать встречу для остальных?"
+
+            # Create yes/no keyboard
+            keyboard = [
+                [
+                    InlineKeyboardButton("Да, запланировать ✅", callback_data=f"ignore_multiple_yes_{poll_id}"),
+                    InlineKeyboardButton("Нет, отменить ❌", callback_data=f"ignore_multiple_no_{poll_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            confirmation_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=confirmation_message,
+                reply_markup=reply_markup
+            )
+
+            # Store confirmation data for later handling
+            poll_data['ignore_confirmation'] = {
+                'message_id': confirmation_msg.message_id,
+                'cant_make_it_users': cant_make_it_users
+            }
+
+            logger.info(f"Asked for confirmation to ignore {user_count} users in poll {poll_id}")
+
+        except Exception as e:
+            logger.error(f"Error asking multiple ignore confirmation: {e}")
+
+    async def ask_ignore_user_and_proceed(self, poll_id, cant_make_it_user_id, context):
+        """Ask if we should ignore the user who can't make it and proceed with resolution"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+
+            # Ask for confirmation to proceed without the user who can't make it
+            confirmation_message = "Игнорировать этого пользователя и запланировать встречу для остальных?"
+
+            # Create yes/no keyboard
+            keyboard = [
+                [
+                    InlineKeyboardButton("Да, запланировать ✅",
+                                         callback_data=f"ignore_yes_{poll_id}_{cant_make_it_user_id}"),
+                    InlineKeyboardButton("Нет, отменить ❌", callback_data=f"ignore_no_{poll_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            confirmation_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=confirmation_message,
+                reply_markup=reply_markup
+            )
+
+            # Store confirmation data for later handling
+            poll_data['ignore_confirmation'] = {
+                'message_id': confirmation_msg.message_id,
+                'cant_make_it_user_id': cant_make_it_user_id
+            }
+
+            logger.info(f"Asked for confirmation to ignore user {cant_make_it_user_id} in poll {poll_id}")
+
+        except Exception as e:
+            logger.error(f"Error asking ignore confirmation: {e}")
+
+    async def handle_ignore_confirmation(self, query, poll_id, cant_make_it_user_id, should_ignore, context):
+        """Handle yes/no response to ignore user confirmation"""
+        try:
+            await query.answer()
+
+            if poll_id not in self.active_polls:
+                await query.edit_message_text("❌ Опрос не найден.")
+                return
+
+            poll_data = self.active_polls[poll_id]
+
+            if should_ignore:
+                # Proceed with resolution excluding the user who can't make it
+                await query.edit_message_text("✅ Планируем встречу для остальных участников...")
+                await self.resolve_poll_excluding_cant_make_it(poll_id, context)
+            else:
+                # Don't proceed, keep poll active
+                await query.edit_message_text("❌ Встреча не запланирована. Опрос продолжается.")
+
+            # Clean up confirmation data
+            if 'ignore_confirmation' in poll_data:
+                del poll_data['ignore_confirmation']
+
+        except Exception as e:
+            logger.error(f"Error handling ignore confirmation: {e}")
+            await query.edit_message_text("❌ Произошла ошибка при обработке ответа.")
+
+    async def handle_multiple_ignore_confirmation(self, query, poll_id, should_ignore, context):
+        """Handle yes/no response to ignore multiple users confirmation"""
+        try:
+            await query.answer()
+
+            if poll_id not in self.active_polls:
+                await query.edit_message_text("❌ Опрос не найден.")
+                return
+
+            poll_data = self.active_polls[poll_id]
+
+            if should_ignore:
+                # Proceed with resolution excluding the users who can't make it
+                await query.edit_message_text("✅ Планируем встречу для остальных участников...")
+                await self.resolve_poll_excluding_cant_make_it(poll_id, context)
+            else:
+                # Don't proceed, keep poll active
+                await query.edit_message_text("❌ Встреча не запланирована. Опрос продолжается.")
+                # Clear the cant_make_it_users so they can be processed again if needed
+                if 'cant_make_it_users' in poll_data:
+                    del poll_data['cant_make_it_users']
+
+            # Clean up confirmation data
+            if 'ignore_confirmation' in poll_data:
+                del poll_data['ignore_confirmation']
+
+        except Exception as e:
+            logger.error(f"Error handling multiple ignore confirmation: {e}")
+            await query.edit_message_text("❌ Произошла ошибка при обработке ответа.")
+
+    async def resolve_poll_excluding_cant_make_it(self, poll_id, context):
+        """Resolve poll using regular rules but excluding 'Не могу' votes"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+            vote_counts = poll_data['vote_counts']
+            target_member_count = poll_data.get('target_member_count', 1)
+
+            # Create vote counts excluding "Не могу 😔"
+            filtered_vote_counts = {}
+            for option_text, voters in vote_counts.items():
+                if option_text != "Не могу 😔":
+                    filtered_vote_counts[option_text] = voters
+
+            # Get all voters who didn't vote only for "Не могу"
+            other_voters = set()
+            for voters in filtered_vote_counts.values():
+                other_voters.update(voters)
+
+            if not other_voters:
+                # No one voted for any real options - everyone voted "Не могу"
+                playful_message = "Никто не может прийти на встречу! 😅 Попробуйте создать новый опрос с другими вариантами времени.\n\nИспользуйте /create_poll"
+                await context.bot.send_message(chat_id=chat_id, text=playful_message)
+
+                # Close poll and clean up
+                await self.close_poll_and_clean_up(poll_id, context)
+                return
+
+            # Apply resolution logic to filtered votes
+            logger.info(f"Filtered vote counts (excluding 'Не могу'): {filtered_vote_counts}")
+
+            # Check for common options among other voters
+            common_option = None
+
+            # Case 1: Everyone (who didn't vote "Не могу") voted for one identical option
+            for option_text, voters in filtered_vote_counts.items():
+                if len(voters) == len(other_voters):
+                    # Check if these voters voted ONLY for this option
+                    voters_only_this_option = True
+                    for voter in voters:
+                        for other_option, other_voters_set in filtered_vote_counts.items():
+                            if other_option != option_text and voter in other_voters_set:
+                                voters_only_this_option = False
+                                break
+                        if not voters_only_this_option:
+                            break
+
+                    if voters_only_this_option:
+                        common_option = option_text
+                        logger.info(f"Case 1: All other users voted only for '{option_text}'")
+                        break
+
+            # Case 2: One option voted by everyone (who didn't vote "Не могу")
+            if not common_option:
+                for option_text, voters in filtered_vote_counts.items():
+                    if len(voters) == len(other_voters):
+                        common_option = option_text
+                        logger.info(f"Case 2: All other users voted for '{option_text}'")
+                        break
+
+            # Case 4: Everyone voted for same multiple options → select earliest
+            if not common_option:
+                options_everyone_voted = []
+                for option_text, voters in filtered_vote_counts.items():
+                    if len(voters) == len(other_voters):
+                        options_everyone_voted.append(option_text)
+
+                if len(options_everyone_voted) > 1:
+                    common_option = min(options_everyone_voted)
+                    logger.info(f"Case 4: Selected earliest from multiple common options: '{common_option}'")
+
+            if common_option:
+                # Found common option, proceed with normal meeting confirmation
+                await self.confirm_meeting_with_option(poll_id, common_option, context)
+            else:
+                # No common option among other voters
+                no_common_message = "Остальные участники не выбрали общий вариант"
+                await context.bot.send_message(chat_id=chat_id, text=no_common_message)
+
+                # Close poll and suggest creating new one
+                await self.close_poll_and_suggest_new(poll_id, context)
+
+        except Exception as e:
+            logger.error(f"Error resolving poll excluding 'Не могу': {e}")
+
+    async def confirm_meeting_with_option(self, poll_id, option, context):
+        """Confirm meeting with the selected option"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+
+            # Send confirmation message
+            confirmation_message = f"Собираемся в {option}"
+            sent_message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=confirmation_message
+            )
+
+            # Pin the confirmation message
+            try:
+                await context.bot.pin_chat_message(
+                    chat_id=chat_id,
+                    message_id=sent_message.message_id,
+                    disable_notification=True
+                )
+                logger.info(f"Pinned confirmation message in chat {chat_id}")
+
+                # Store pinned message info for later unpinning
+                self.pinned_messages[f"{chat_id}_{poll_id}"] = {
+                    'chat_id': chat_id,
+                    'message_id': sent_message.message_id
+                }
+            except Exception as e:
+                logger.warning(f"Could not pin message in chat {chat_id}: {e}")
+
+            # Get all voters from the poll
+            poll_voters = set()
+            if poll_id in self.active_polls:
+                poll_data = self.active_polls[poll_id]
+                if 'vote_counts' in poll_data:
+                    # Extract all voters from vote_counts (which contains voters by option)
+                    for option_text, voters in poll_data['vote_counts'].items():
+                        poll_voters.update(voters)
+                    # Exclude bots from voters
+                    try:
+                        bot_info = await context.bot.get_me()
+                        bot_user_id = bot_info.id
+                        poll_voters.discard(bot_user_id)
+                    except Exception as e:
+                        logger.warning(f"Could not get bot info to exclude from voters: {e}")
+
+            # Schedule immediate confirmation (1 minute after poll is confirmed)
+            immediate_confirmation_task = asyncio.create_task(
+                self.schedule_immediate_confirmation(chat_id, option, context, poll_voters))
+
+            # Schedule reminders
+            confirmation_task = asyncio.create_task(
+                self.schedule_confirmation_question(poll_id, chat_id, set(), context, option))
+            unpin_task = asyncio.create_task(self.schedule_unpin_message(poll_id, chat_id, context, option))
+            followup_task = asyncio.create_task(self.schedule_followup_message(chat_id, context, option))
+
+            # Track scheduled tasks for this chat
+            if chat_id not in self.scheduled_tasks:
+                self.scheduled_tasks[chat_id] = []
+            self.scheduled_tasks[chat_id].extend([
+                {'task': confirmation_task, 'type': 'confirmation', 'poll_id': poll_id},
+                {'task': unpin_task, 'type': 'unpin', 'poll_id': poll_id},
+                {'task': followup_task, 'type': 'followup', 'poll_id': poll_id}
+            ])
+
+            # Close the poll
+            try:
+                poll_message_id = poll_data['poll_message_id']
+                await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                logger.info(f"Closed poll {poll_id} after meeting confirmation")
+            except Exception as e:
+                logger.warning(f"Could not close poll {poll_id}: {e}")
+
+            # Clean up poll data
+            self.cleanup_poll_data(poll_id)
+            del self.active_polls[poll_id]
+
+        except Exception as e:
+            logger.error(f"Error confirming meeting: {e}")
+
+    async def close_poll_and_suggest_new(self, poll_id, context):
+        """Close poll and suggest creating a new one"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+
+            # Close the poll
+            try:
+                poll_message_id = poll_data['poll_message_id']
+                await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                logger.info(f"Closed poll {poll_id} - no common option")
+            except Exception as e:
+                logger.warning(f"Could not close poll {poll_id}: {e}")
+
+            # Suggest creating new poll
+            suggest_message = "Попробуйте создать новый опрос с другими вариантами времени.\n\nИспользуйте /create_poll"
+            await context.bot.send_message(chat_id=chat_id, text=suggest_message)
+
+            # Clean up poll data
+            self.cleanup_poll_data(poll_id)
+            del self.active_polls[poll_id]
+
+        except Exception as e:
+            logger.error(f"Error closing poll and suggesting new: {e}")
+
+    async def close_poll_and_clean_up(self, poll_id, context):
+        """Close poll and clean up without suggesting new poll"""
+        try:
+            if poll_id not in self.active_polls:
+                return
+
+            poll_data = self.active_polls[poll_id]
+            chat_id = poll_data['chat_id']
+
+            # Close the poll
+            try:
+                poll_message_id = poll_data['poll_message_id']
+                await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                logger.info(f"Closed poll {poll_id} - everyone voted 'Не могу'")
+            except Exception as e:
+                logger.warning(f"Could not close poll {poll_id}: {e}")
+
+            # Clean up poll data
+            self.cleanup_poll_data(poll_id)
+            del self.active_polls[poll_id]
+
+        except Exception as e:
+            logger.error(f"Error closing poll and cleaning up: {e}")
+
+    async def handle_pin_proposal(self, query, poll_id, should_pin, context):
+        """Handle yes/no response to pin proposal"""
+        try:
+            await query.answer()
+
+            if poll_id not in self.active_polls:
+                await query.edit_message_text("❌ Опрос не найден.")
+                return
+
+            poll_data = self.active_polls[poll_id]
+            proposal_data = poll_data.get('proposal')
+
+            if not proposal_data:
+                await query.edit_message_text("❌ Предложение не найдено.")
+                return
+
+            proposed_option = proposal_data['proposed_option']
+            chat_id = poll_data['chat_id']
+
+            if should_pin:
+                # Pin the meeting confirmation and schedule reminders
+                confirmation_message = f"Собираемся в {proposed_option}"
+
+                sent_message = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=confirmation_message
+                )
+
+                # Pin the confirmation message
+                try:
+                    await context.bot.pin_chat_message(
+                        chat_id=chat_id,
+                        message_id=sent_message.message_id,
+                        disable_notification=True
+                    )
+                    logger.info(f"Pinned proposal confirmation message in chat {chat_id}")
+
+                    # Store pinned message info for later unpinning
+                    self.pinned_messages[f"{chat_id}_{poll_id}"] = {
+                        'chat_id': chat_id,
+                        'message_id': sent_message.message_id
+                    }
+                except Exception as e:
+                    logger.warning(f"Could not pin proposal message in chat {chat_id}: {e}")
+
+                # Get all voters from the poll
+                poll_voters = set()
+                if poll_id in self.active_polls:
+                    poll_data = self.active_polls[poll_id]
+                    if 'vote_counts' in poll_data:
+                        # Extract all voters from vote_counts (which contains voters by option)
+                        for option_text, voters in poll_data['vote_counts'].items():
+                            poll_voters.update(voters)
+                        # Exclude bots from voters
+                        try:
+                            bot_info = await context.bot.get_me()
+                            bot_user_id = bot_info.id
+                            poll_voters.discard(bot_user_id)
+                        except Exception as e:
+                            logger.warning(f"Could not get bot info to exclude from voters: {e}")
+
+                # Schedule immediate confirmation (1 minute after poll is confirmed)
+                immediate_confirmation_task = asyncio.create_task(
+                    self.schedule_immediate_confirmation(chat_id, proposed_option, context, poll_voters))
+
+                # Schedule reminders for the proposed meeting
+                confirmation_task = asyncio.create_task(
+                    self.schedule_confirmation_question(poll_id, chat_id, set(), context, proposed_option))
+                unpin_task = asyncio.create_task(
+                    self.schedule_unpin_message(poll_id, chat_id, context, proposed_option))
+                followup_task = asyncio.create_task(self.schedule_followup_message(chat_id, context, proposed_option))
+
+                # Track scheduled tasks for this chat
+                if chat_id not in self.scheduled_tasks:
+                    self.scheduled_tasks[chat_id] = []
+                self.scheduled_tasks[chat_id].extend([
+                    {'task': confirmation_task, 'type': 'confirmation', 'poll_id': poll_id},
+                    {'task': unpin_task, 'type': 'unpin', 'poll_id': poll_id},
+                    {'task': followup_task, 'type': 'followup', 'poll_id': poll_id}
+                ])
+
+                await query.edit_message_text(
+                    f"✅ Встреча запланирована: {proposed_option}\n📌 Сообщение закреплено и напоминания настроены!")
+
+                # Close the poll since meeting is confirmed
+                try:
+                    poll_message_id = poll_data['poll_message_id']
+                    await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                    logger.info(f"Closed poll {poll_id} after proposal confirmation")
+                except Exception as e:
+                    logger.warning(f"Could not close poll {poll_id}: {e}")
+
+            else:
+                await query.edit_message_text(f"❌ Встреча не запланирована. Опрос продолжается.")
+
+            # Clean up proposal data
+            if 'proposal' in poll_data:
+                del poll_data['proposal']
+
+        except Exception as e:
+            logger.error(f"Error handling pin proposal: {e}")
+            await query.edit_message_text("❌ Произошла ошибка при обработке ответа.")
+
+
+def main():
+    """Main function"""
+    print("🚀 Starting Simple Poll Bot...")
+
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not token:
+        print("❌ TELEGRAM_BOT_TOKEN not found in environment!")
+        return
+
+    bot = SimplePollBot(token)
+
+    # Create application
+    app = Application.builder().token(token).build()
+
+    # Add handlers
+    app.add_handler(CommandHandler("start", bot.start))
+    app.add_handler(CommandHandler("help", bot.help_command))
+    app.add_handler(CommandHandler("info", bot.info_command))
+    app.add_handler(CommandHandler("create_poll", bot.create_poll))
+    app.add_handler(CommandHandler("cancel_bot", bot.cancel_bot))
+    app.add_handler(CommandHandler("die", bot.die_command))
+    app.add_handler(CallbackQueryHandler(bot.button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.text_handler))
+    app.add_handler(PollAnswerHandler(bot.poll_answer_handler))
+    app.add_handler(MessageReactionHandler(bot.message_reaction_handler))
+
+    print("✅ Simple Poll Bot is running...")
+    print("⏹️  Press Ctrl+C to stop")
+
+    # Run the bot
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
