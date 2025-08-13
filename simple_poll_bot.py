@@ -92,7 +92,23 @@ logger = logging.getLogger(__name__)
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
     from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, \
-        PollAnswerHandler, MessageReactionHandler
+        PollAnswerHandler
+
+    # Import subscribe handler
+    from subscribe_handler import handle_subscribe, handle_unsubscribe, handle_subscribers_count
+
+    # Persistent storage for polls/votes/confirmations
+    try:
+        from poll_storage import (
+            upsert_poll,
+            set_poll_closed,
+            get_poll,
+            upsert_vote,
+            get_votes,
+        )
+    except ImportError:
+        upsert_poll = set_poll_closed = get_poll = upsert_vote = get_votes = upsert_immediate_confirmation = get_immediate_confirmation = None
+        logger.warning("poll_storage not available; state will not persist across restarts")
 except ImportError:
     print("❌ python-telegram-bot not installed!")
     print("📝 Install it with: py -m pip install python-telegram-bot")
@@ -101,11 +117,8 @@ except ImportError:
 # Timeout constants (in seconds)
 SESSION_TIMEOUT = 86400  # 24 hours
 POLL_VOTING_TIMEOUT = 3600  # 1 hour
-CONFIRMATION_REACTION_TIMEOUT = 3600  # 1 hour
-# PROCEED_CONFIRMATION_TIMEOUT = 60  # 1 minute (removed - no timeout for proceed buttons)
 CLEANUP_INTERVAL = 3600  # 1 hour
 FALLBACK_WAIT_TIME = 5  # 5 seconds for past times
-IMMEDIATE_CONFIRMATION_DELAY = 60  # 1 minute delay for immediate confirmation
 
 
 class SimplePollBot:
@@ -113,7 +126,7 @@ class SimplePollBot:
         self.token = token
         self.sessions = {}  # Format: {chat_id: {user_id: session_data}}
         self.active_polls = {}  # Track active polls and their voters
-        self.confirmation_messages = {}  # Track confirmation messages and reactions
+        # Removed: confirmation_messages - no reaction tracking needed
         self.pinned_messages = {}  # Track pinned messages for unpinning
         self.scheduled_tasks = {}  # Track scheduled tasks for cancellation
         self.cleanup_task = None  # Track cleanup task
@@ -122,6 +135,43 @@ class SimplePollBot:
 
         # Session timeout: 24 hours (86400 seconds)
         self.session_timeout = SESSION_TIMEOUT
+
+        # Try to rehydrate active polls from DB
+        try:
+            from poll_storage import get_open_polls, get_votes
+            open_polls = get_open_polls()
+            for p in open_polls:
+                pid = p['poll_id']
+                self.active_polls[pid] = {
+                    'chat_id': int(p['chat_id']),
+                    'question': p['question'],
+                    'vote_count': 0,  # computed below
+                    'target_member_count': int(p['target_member_count']) if p.get('target_member_count') is not None else 1,
+                    'context': None,  # will be filled when handlers run in this process
+                    'creator_id': int(p['creator_id']),
+                    'poll_message_id': int(p['poll_message_id']) if p.get('poll_message_id') else None,
+                    'options': p.get('options', []),
+                    'vote_counts': {}
+                }
+                # reconstruct vote_counts
+                votes = get_votes(pid)
+                # votes is {user_id_str: set(option_ids)}; map to option text buckets
+                option_texts = self.active_polls[pid]['options']
+                vc = {}
+                unique_voters = set()
+                for uid_str, option_ids in votes.items():
+                    uid = int(uid_str)
+                    unique_voters.add(uid)
+                    for oid in option_ids:
+                        if 0 <= oid < len(option_texts):
+                            text = option_texts[oid]
+                            vc.setdefault(text, set()).add(uid)
+                self.active_polls[pid]['vote_counts'] = vc
+                self.active_polls[pid]['vote_count'] = len(unique_voters)
+            if open_polls:
+                logger.info(f"Rehydrated {len(open_polls)} open polls from DB")
+        except Exception as e:
+            logger.warning(f"Could not rehydrate polls from DB: {e}")
 
     def start_cleanup_task(self):
         """Start the session cleanup task if not already running"""
@@ -136,6 +186,49 @@ class SimplePollBot:
         """Get Russian day name"""
         days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
         return days[date.weekday()]
+    
+    def parse_meeting_time(self, proposed_option: str):
+        """Parse meeting time from proposed option string"""
+        try:
+            from datetime import datetime
+            import re
+            
+            # Try to extract date and time from the proposed option
+            # Expected format: "Понедельник, 25.11.2024 в 15:00"
+            date_time_pattern = r'(\d{1,2})\.(\d{1,2})\.(\d{4}).*?(\d{1,2}):(\d{2})'
+            match = re.search(date_time_pattern, proposed_option)
+            
+            if match:
+                day, month, year, hour, minute = match.groups()
+                meeting_datetime = datetime(
+                    year=int(year),
+                    month=int(month), 
+                    day=int(day),
+                    hour=int(hour),
+                    minute=int(minute)
+                )
+                
+                # Add timezone info (Polish timezone)
+                try:
+                    from zoneinfo import ZoneInfo
+                    polish_tz = ZoneInfo("Europe/Warsaw")
+                    meeting_datetime = meeting_datetime.replace(tzinfo=polish_tz)
+                except ImportError:
+                    try:
+                        import pytz
+                        polish_tz = pytz.timezone("Europe/Warsaw")
+                        meeting_datetime = polish_tz.localize(meeting_datetime)
+                    except ImportError:
+                        logger.warning("No timezone library available, using naive datetime")
+                
+                return meeting_datetime
+            else:
+                logger.warning(f"Could not parse date/time from: {proposed_option}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error parsing meeting time: {e}")
+            return None
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -157,7 +250,7 @@ class SimplePollBot:
             "3️⃣ Выбираешь удобное время\n"
             "4️⃣ Создается опрос для голосования\n"
             "5️⃣ Автоматически определяется результат и закрепляется\n"
-            "6️⃣ Отправляется подтверждение участия за 24ч/3ч до встречи\n"
+            "6️⃣ Отправляется подтверждение участия за 24ч/4ч до встречи\n"
             "7️⃣ Сообщение открепляется через 10 часов после встречи\n"
             "8️⃣ Спрашиваю 'Как прошла встреча?' через 3 дня\n\n"
             "🚀 Начни планировать встречу с /create_poll!"
@@ -180,8 +273,8 @@ class SimplePollBot:
             "• **Мгновенное подтверждение:** через 1 минуту после закрытия опроса\n"
             "• **Подтверждение перед встречей:**\n"
             "  - Если встреча >24ч → за 24 часа до встречи\n"
-            "  - Если встреча 3-24ч → за 3 часа до встречи\n"
-            "  - Если встреча <3ч → подтверждение не отправляется\n"
+            '  - Если встреча 4-24ч → за 4 часа до встречи\n'
+            '  - Если встреча <4ч → подтверждение не отправляется\n'
             "• **Открепление сообщений:** через 10 часов после встречи\n"
             "• **Вопрос о встрече:** через 72 часа после встречи\n\n"
             "🌍 **Часовой пояс:** Все время в польском часовом поясе (Europe/Warsaw)\n\n"
@@ -518,14 +611,31 @@ class SimplePollBot:
             self.active_polls[poll_id] = {
                 'chat_id': session['chat_id'],
                 'question': session['question'],
-                'vote_count': 0,  # Simple counter instead of tracking user IDs
-                'target_member_count': 1,  # Will be updated by get_chat_members_and_monitor
+                'vote_count': 0,  # unique voters count
+                'target_member_count': 1,  # updated below
                 'context': context,
-                'creator_id': user_id,  # Track who created the poll
-                'poll_message_id': poll_message.message_id,  # Store message ID to get poll results
-                'options': options,  # Store options to map results
-                'vote_counts': {}  # Track votes manually as fallback
+                'creator_id': user_id,
+                'poll_message_id': poll_message.message_id,
+                'options': options,
+                'vote_counts': {}
             }
+
+            # Persist poll
+            try:
+                if upsert_poll:
+                    upsert_poll(
+                        poll_id=poll_id,
+                        chat_id=session['chat_id'],
+                        question=session['question'],
+                        options=options,
+                        creator_id=user_id,
+                        poll_message_id=poll_message.message_id,
+                        target_member_count=1,
+                        pinned_message_id=None,
+                        is_closed=False,
+                    )
+            except Exception as e:
+                logger.warning(f"Could not persist poll {poll_id}: {e}")
 
             # Get chat members and start monitoring
             await self.get_chat_members_and_monitor(poll_id, session['chat_id'], context)
@@ -564,6 +674,12 @@ class SimplePollBot:
                     # Exclude bots from the count (at least this bot)
                     human_members = max(1, total_members - 1)
                     self.active_polls[poll_id]['target_member_count'] = human_members
+                    # persist update
+                    try:
+                        if upsert_poll:
+                            upsert_poll(poll_id, chat_id, self.active_polls[poll_id]['question'], self.active_polls[poll_id]['options'], self.active_polls[poll_id]['creator_id'], self.active_polls[poll_id]['poll_message_id'], human_members, False)
+                    except Exception as e:
+                        logger.warning(f"Persist target_member_count failed for {poll_id}: {e}")
                     logger.info(
                         f"Chat {chat_id} has {total_members} total members, {human_members} human members (via getChatMemberCount)")
                 except Exception as e:
@@ -573,6 +689,11 @@ class SimplePollBot:
                     # Exclude bots from the count (at least this bot)
                     human_members = max(1, total_members - 1)
                     self.active_polls[poll_id]['target_member_count'] = human_members
+                    try:
+                        if upsert_poll:
+                            upsert_poll(poll_id, chat_id, self.active_polls[poll_id]['question'], self.active_polls[poll_id]['options'], self.active_polls[poll_id]['creator_id'], self.active_polls[poll_id]['poll_message_id'], human_members, False)
+                    except Exception as e:
+                        logger.warning(f"Persist target_member_count failed for {poll_id} (fallback): {e}")
                     logger.info(
                         f"Fallback: Chat {chat_id} has {total_members} total members, {human_members} human members (via chat.member_count)")
 
@@ -639,6 +760,13 @@ class SimplePollBot:
             # Update user's vote state
             self.user_vote_states[poll_user_key] = current_option_ids
 
+            # Persist vote
+            try:
+                if upsert_vote:
+                    upsert_vote(poll_id, user_id, current_option_ids)
+            except Exception as e:
+                logger.warning(f"Could not persist vote for poll {poll_id}, user {user_id}: {e}")
+
             # Check if user voted only for "Не могу 😔"
             if len(current_option_ids) == 1:
                 cant_make_it_option_id = None
@@ -666,17 +794,24 @@ class SimplePollBot:
                 logger.info(f"Current vote distribution: {vote_counts}")
 
                 # Check if everyone has voted (this will re-evaluate resolution logic)
-                await self.check_if_everyone_voted(poll_id, context)
+                poll_completed = await self.check_if_everyone_voted(poll_id, context)
+
+                # No immediate reminders; only 1-hour timeout scheduling remains
+                if not poll_completed:
+                    # Check if this was a new vote (user added options) vs retraction (user removed options)
+                    is_new_vote = len(current_option_ids) > len(previous_option_ids)
+                    is_first_vote = len(previous_option_ids) == 0 and len(current_option_ids) > 0
+                    
+                    # Only the 1-hour timeout reminder exists; nothing to send here
             else:
                 logger.info(f"Poll {poll_id} was already resolved and cleaned up")
         else:
             logger.warning(f"Received vote for unknown poll {poll_id}")
 
-    #    TODO get everyone from chat
     async def check_if_everyone_voted(self, poll_id, context):
         """Check if everyone has voted based on getChatMembersCount"""
         if poll_id not in self.active_polls:
-            return
+            return True  # Poll doesn't exist, consider it completed
 
         poll_data = self.active_polls[poll_id]
         vote_count = poll_data['vote_count']
@@ -698,14 +833,15 @@ class SimplePollBot:
                 logger.info(f"Everyone voted 'Не могу' for poll {poll_id}")
                 playful_message = "Никто не может прийти на встречу! 😅 Попробуйте создать новый опрос с другими вариантами времени.\n\nИспользуйте /create_poll"
                 await context.bot.send_message(chat_id=chat_id, text=playful_message)
-                await self.close_poll_and_clean_up(poll_id, context)
-                return
+                # Everyone voted 'Не могу' → close poll and unschedule voting timeout
+                await self.close_poll_and_clean_up(poll_id, context, cancel_voting_timeout=True)
+                return True  # Poll completed
 
             # Check if some users voted only "Не могу" and handle them
             if cant_make_it_users and effective_member_count > 0:
                 logger.info(f"Processing users who can't make it: {cant_make_it_users}")
                 await self.handle_cant_make_it_users(poll_id, cant_make_it_users, context)
-                return
+                return True  # Poll completed
 
             try:
                 # Get current time and date
@@ -714,7 +850,7 @@ class SimplePollBot:
                 date_str = now.strftime("%d.%m.%Y")
 
                 # Get poll results to find the most voted option
-                most_voted_result = await self.get_most_voted_option(poll_id, context)
+                most_voted_result = await self.get_most_voted_option_fallback_with_new_logic(poll_id, context)
 
                 # Send confirmation message with the most voted result
                 if most_voted_result:
@@ -723,7 +859,8 @@ class SimplePollBot:
                         # Send playful message and close poll
                         playful_message = "Никто не может прийти на встречу! 😅 Попробуйте создать новый опрос с другими вариантами времени.\n\nИспользуйте /create_poll"
                         await context.bot.send_message(chat_id=chat_id, text=playful_message)
-                        await self.close_poll_and_clean_up(poll_id, context)
+                        # Everyone voted 'Не могу' → close poll and unschedule voting timeout
+                        await self.close_poll_and_clean_up(poll_id, context, cancel_voting_timeout=True)
                         return
                     # Check if revote was prompted
                     elif most_voted_result == "REVOTE_PROMPTED":
@@ -753,6 +890,11 @@ class SimplePollBot:
                     try:
                         poll_message_id = poll_data['poll_message_id']
                         await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                        try:
+                            if set_poll_closed:
+                                set_poll_closed(poll_id, True)
+                        except Exception as e:
+                            logger.warning(f"DB set_poll_closed failed for {poll_id}: {e}")
                         logger.info(f"Closed poll {poll_id} in chat {chat_id}")
                     except Exception as e:
                         logger.warning(f"Could not close poll {poll_id}: {e}")
@@ -764,6 +906,16 @@ class SimplePollBot:
                             message_id=sent_message.message_id,
                             disable_notification=True
                         )
+                        try:
+                            if upsert_poll:
+                                upsert_poll(poll_id, chat_id, poll_data['question'], poll_data['options'], poll_data['creator_id'], poll_data['poll_message_id'], poll_data.get('target_member_count', 1), sent_message.message_id, False)
+                        except Exception as e:
+                            logger.warning(f"Could not persist pinned message id: {e}")
+                        try:
+                            if upsert_poll:
+                                upsert_poll(poll_id, chat_id, poll_data['question'], poll_data['options'], poll_data['creator_id'], poll_data['poll_message_id'], poll_data.get('target_member_count', 1), sent_message.message_id, False)
+                        except Exception as e:
+                            logger.warning(f"Could not persist pinned message id: {e}")
                         logger.info(f"Pinned confirmation message in chat {chat_id}")
 
                         # Store pinned message info for later unpinning
@@ -790,17 +942,13 @@ class SimplePollBot:
                             except Exception as e:
                                 logger.warning(f"Could not get bot info to exclude from voters: {e}")
 
-                    # Schedule immediate confirmation (1 minute after poll is confirmed)
-                    immediate_confirmation_task = asyncio.create_task(
-                        self.schedule_immediate_confirmation(chat_id, most_voted_result, context, poll_voters))
-
-                    # Schedule "В силе?" message for the day before at 18:00
+                    # Schedule "План в силе?" message according to timing logic (24h/4h before meeting)
                     confirmation_task = asyncio.create_task(
-                        self.schedule_confirmation_question(poll_id, chat_id, set(), context, most_voted_result))
+                        self.schedule_confirmation_message(poll_id, chat_id, context, most_voted_result, poll_voters))
 
                     # Schedule unpinning at the event time
                     unpin_task = asyncio.create_task(
-                        self.schedule_unpin_message(poll_id, chat_id, context, most_voted_result))
+                        self.schedule_unpin_message(poll_id, chat_id, context, most_voted_result, sent_message.message_id))
 
                     # Schedule follow-up message for the day after the meeting
                     followup_task = asyncio.create_task(
@@ -816,40 +964,32 @@ class SimplePollBot:
                     ])
                 else:
                     logger.info(f"Poll {poll_id} result was 'Не могу' or error - no scheduling or pinning")
+                    # Close the poll and mark as closed in DB, then clean up
+                    try:
+                        poll_message_id = poll_data['poll_message_id']
+                        await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                        try:
+                            if set_poll_closed:
+                                set_poll_closed(poll_id, True)
+                        except Exception as e:
+                            logger.warning(f"DB set_poll_closed failed for {poll_id}: {e}")
+                        logger.info(f"Closed poll {poll_id} after 'Не могу' result")
+                    except Exception as e:
+                        logger.warning(f"Could not close poll {poll_id} after 'Не могу' result: {e}")
 
-                # Don't clean up poll data yet - we need it for the confirmation question
-                logger.info(f"Poll {poll_id} completed - everyone voted, scheduling confirmation question")
+                    # Clean up poll data completely (no further scheduling for 'Не могу')
+                    self.cleanup_poll_data(poll_id)
+                    if poll_id in self.active_polls:
+                        del self.active_polls[poll_id]
+
+                # Finalization log
+                logger.info(f"Poll {poll_id} completed - finalization done")
 
             except Exception as e:
                 logger.error(f"Error sending confirmation message: {e}")
         else:
             logger.info(f"Not everyone voted yet for poll {poll_id}. Votes: {vote_count}/{target_member_count}")
 
-    async def get_most_voted_option(self, poll_id, context):
-        """Get the most voted option from the poll, handling ties intelligently"""
-        try:
-            if poll_id not in self.active_polls:
-                logger.error(f"Poll {poll_id} not found in active polls")
-                return None
-
-            poll_data = self.active_polls[poll_id]
-            chat_id = poll_data['chat_id']
-            message_id = poll_data['poll_message_id']
-
-            logger.info(f"Trying to get poll results for poll {poll_id}, chat {chat_id}, message {message_id}")
-
-            # Skip API call and go directly to fallback with new resolution logic
-            # The API call to get poll results is not reliable, so we'll use our tracked votes
-            logger.info(f"Using tracked votes for poll {poll_id} resolution")
-            return await self.get_most_voted_option_fallback_with_new_logic(poll_id, context)
-
-        except Exception as e:
-            logger.error(f"Error getting poll results for {poll_id}: {e}")
-            logger.error(f"Exception details: {type(e).__name__}: {str(e)}")
-
-            # Final fallback: use manually tracked votes with new logic
-            logger.info("Using final fallback method with new resolution logic")
-            return await self.get_most_voted_option_fallback_with_new_logic(poll_id, context)
 
     async def analyze_poll_results(self, poll, poll_id):
         """Analyze poll results with new resolution logic"""
@@ -1055,54 +1195,8 @@ class SimplePollBot:
             logger.error(f"Error in fallback method with new logic: {e}")
             return None
 
-    def get_most_voted_option_fallback(self, poll_id):
-        """Old fallback method - kept for compatibility but should not be used"""
-        logger.warning("Using deprecated fallback method - this should not happen with new logic")
-        try:
-            if poll_id not in self.active_polls:
-                logger.error(f"Poll {poll_id} not found in active polls for fallback")
-                return None
-
-            vote_counts = self.active_polls[poll_id]['vote_counts']
-            logger.info(f"Fallback vote counts: {vote_counts}")
-
-            if not vote_counts:
-                logger.error("No vote counts available in fallback")
-                return None
-
-            # Find option with most votes and detect ties
-            max_votes = -1
-            tied_options = []
-
-            for option_text, voters in vote_counts.items():
-                vote_count = len(voters)
-                logger.info(f"Fallback - Option '{option_text}' has {vote_count} votes")
-                if vote_count > max_votes:
-                    max_votes = vote_count
-                    tied_options = [option_text]
-                elif vote_count == max_votes and vote_count > 0:
-                    tied_options.append(option_text)
-
-            # Check for ties (excluding "Не могу 😔" if there are other options)
-            if len(tied_options) > 1:
-                tied_options_without_cant = [opt for opt in tied_options if opt != "Не могу 😔"]
-                if tied_options_without_cant and len(tied_options_without_cant) > 1:
-                    logger.info(f"Fallback detected tie: {tied_options_without_cant}")
-                    # For fallback, just return the first option (tie handling should be done in main method)
-                    return tied_options_without_cant[0]
-                elif tied_options_without_cant:
-                    return tied_options_without_cant[0]
-
-            most_voted_option = tied_options[0] if tied_options else None
-            logger.info(f"Fallback result - Most voted option: '{most_voted_option}' with {max_votes} votes")
-            return most_voted_option
-
-        except Exception as e:
-            logger.error(f"Error in fallback method: {e}")
-            return None
-
-    async def schedule_confirmation_question(self, poll_id, chat_id, all_members, context, poll_result):
-        """Schedule 'В силе?' confirmation question - day before at 18:00 or 3 hours before if less than 1 day"""
+    async def schedule_confirmation_message(self, poll_id, chat_id, context, poll_result, poll_voters=None):
+        """Schedule 'В силе?' confirmation question - 24h before if >24h away, 4 hours before if 4-24h away"""
         try:
             # Extract date and time from poll result (e.g., "Понедельник (30.12) в 18:00")
             import re
@@ -1149,13 +1243,13 @@ class SimplePollBot:
                 # More than 24 hours - send 24 hours before meeting
                 confirmation_datetime = meeting_datetime - timedelta(hours=24)
                 confirmation_strategy = "24 hours before meeting"
-            elif hours_until_meeting > 3:
-                # Less than 24 hours but more than 3 hours - send 3 hours before
-                confirmation_datetime = meeting_datetime - timedelta(hours=3)
-                confirmation_strategy = "3 hours before meeting"
+            elif hours_until_meeting > 4:
+                # Less than 24 hours but more than 4 hours - send 4 hours before
+                confirmation_datetime = meeting_datetime - timedelta(hours=4)
+                confirmation_strategy = "4 hours before meeting"
             else:
-                # Less than 3 hours - don't send confirmation
-                logger.info(f"Meeting is in {hours_until_meeting:.1f} hours (<3h), skipping confirmation question")
+                # Less than 4 hours - don't send confirmation
+                logger.info(f"Meeting is in {hours_until_meeting:.1f} hours (<4h), skipping confirmation question")
                 return
 
             # Calculate how long to wait
@@ -1169,15 +1263,35 @@ class SimplePollBot:
                 logger.warning("Confirmation time is in the past, sending immediately")
                 wait_seconds = FALLBACK_WAIT_TIME  # Send in 5 seconds if time is past
 
-            await asyncio.sleep(wait_seconds)
-
-            # Send the confirmation question
-            await self.send_confirmation_question(chat_id, all_members, context, poll_result)
+            # Store in database using scheduled tasks module
+            try:
+                from scheduled_tasks import ScheduledTaskManager
+                
+                success = ScheduledTaskManager.schedule_confirmation_message(
+                    chat_id=chat_id,
+                    poll_id=poll_id,
+                    poll_result=poll_result,
+                    meeting_datetime=meeting_datetime,
+                    poll_voters=poll_voters
+                )
+                
+                if not success:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="❌ Ошибка подключения к базе данных. Подтверждение встречи не может быть запланировано."
+                    )
+                
+            except Exception as e:
+                logger.error(f"Error scheduling confirmation task: {e}")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Ошибка подключения к базе данных. Подтверждение встречи не может быть запланировано."
+                )
 
         except Exception as e:
             logger.error(f"Error scheduling confirmation question: {e}")
 
-    async def schedule_unpin_message(self, poll_id, chat_id, context, poll_result):
+    async def schedule_unpin_message(self, poll_id, chat_id, context, poll_result, pinned_message_id):
         """Schedule unpinning of confirmation message at the event time"""
         try:
             # Extract date and time from poll result (e.g., "Пятница (01.08) в 16:00")
@@ -1213,10 +1327,26 @@ class SimplePollBot:
                 logger.warning("Event time is in the past, unpinning immediately")
                 wait_seconds = FALLBACK_WAIT_TIME  # Unpin in 5 seconds if time is past
 
-            await asyncio.sleep(wait_seconds)
-
-            # Unpin the confirmation message
-            await self.unpin_confirmation_message(poll_id, chat_id, context)
+            # Store in database using scheduled tasks module
+            try:
+                from scheduled_tasks import ScheduledTaskManager, parse_meeting_datetime_from_poll_result
+                
+                meeting_datetime = parse_meeting_datetime_from_poll_result(poll_result)
+                if meeting_datetime:
+                    success = ScheduledTaskManager.schedule_unpin_message(
+                        chat_id=chat_id,
+                        poll_id=poll_id,
+                        meeting_datetime=meeting_datetime,
+                        message_id=pinned_message_id
+                    )
+                    
+                    if not success:
+                        logger.error("Failed to schedule unpin message - database connection error")
+                else:
+                    logger.error("Could not parse meeting datetime for unpin scheduling")
+                
+            except Exception as e:
+                logger.error(f"Error scheduling unpin task: {e}")
 
         except Exception as e:
             logger.error(f"Error scheduling unpin message: {e}")
@@ -1269,21 +1399,48 @@ class SimplePollBot:
                     polls_cleared += 1
 
             for poll_id in active_polls_to_remove:
+                # Attempt to stop the poll in Telegram and mark it closed in DB
+                try:
+                    poll_message_id = self.active_polls[poll_id].get('poll_message_id')
+                    if poll_message_id:
+                        try:
+                            await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                            logger.info(f"Stopped poll {poll_id} in chat {chat_id} due to /cancel_bot")
+                        except Exception as e:
+                            logger.warning(f"Could not stop poll {poll_id} during /cancel_bot: {e}")
+                    # Persist closed state
+                    try:
+                        if set_poll_closed:
+                            set_poll_closed(poll_id, True)
+                    except Exception as e:
+                        logger.warning(f"DB set_poll_closed failed for {poll_id} during /cancel_bot: {e}")
+
+                    # Cancel any pending poll-specific tasks (e.g., voting timeout)
+                    try:
+                        from task_storage import cancel_chat_tasks
+                        cancelled = cancel_chat_tasks(chat_id)
+                        logger.info(f"Cancelled {cancelled} pending tasks for poll {poll_id} in chat {chat_id}")
+                    except Exception as e:
+                        logger.warning(f"Could not cancel pending tasks for poll {poll_id}: {e}")
+                except Exception as e:
+                    logger.warning(f"Unexpected error while closing poll {poll_id} during /cancel_bot: {e}")
+
+                # Clean up local state
                 self.cleanup_poll_data(poll_id)
                 del self.active_polls[poll_id]
                 logger.info(f"Cleared active poll {poll_id} for chat {chat_id}")
 
-            # Clear confirmation messages for this chat
+            # Removed: confirmation message tracking - no reactions needed
             confirmations_cleared = 0
-            confirmation_keys_to_remove = []
-            for conf_id, conf_data in self.confirmation_messages.items():
-                if conf_data['chat_id'] == chat_id:
-                    confirmation_keys_to_remove.append(conf_id)
-                    confirmations_cleared += 1
 
-            for conf_id in confirmation_keys_to_remove:
-                del self.confirmation_messages[conf_id]
-                logger.info(f"Cleared confirmation {conf_id} for chat {chat_id}")
+            # Cancel all scheduled tasks in database for this chat
+            cancelled_db_tasks = 0
+            try:
+                from task_storage import cancel_chat_tasks
+                cancelled_db_tasks = cancel_chat_tasks(chat_id)
+                logger.info(f"Cancelled {cancelled_db_tasks} scheduled tasks in database for chat {chat_id}")
+            except Exception as db_error:
+                logger.error(f"Error cancelling database tasks for chat {chat_id}: {db_error}")
 
             # Disable immediate confirmation buttons for this chat
             disabled_immediate_count = 0
@@ -1335,6 +1492,7 @@ class SimplePollBot:
                 f"📋 Отменено задач: {cancelled_count}\n"
                 f"🗳️ Очищено опросов: {polls_cleared}\n"
                 f"💬 Очищено подтверждений: {confirmations_cleared}\n"
+                f"🗄️ Отменено запланированных задач в БД: {cancelled_db_tasks}\n"
                 f"⏰ Отключено немедленных подтверждений: {disabled_immediate_count}\n"
                 f"📌 Откреплено сообщений: {unpinned_count}\n\n"
                 f"Используйте /create_poll чтобы создать новый опрос."
@@ -1400,10 +1558,21 @@ class SimplePollBot:
                 logger.warning("Follow-up time is in the past, sending immediately")
                 wait_seconds = FALLBACK_WAIT_TIME  # Send in 5 seconds if time is past
 
-            await asyncio.sleep(wait_seconds)
-
-            # Send the follow-up message
-            await self.send_followup_message(chat_id, context)
+            # Store in database using scheduled tasks module
+            try:
+                from scheduled_tasks import ScheduledTaskManager
+                
+                success = ScheduledTaskManager.schedule_followup_message(
+                    chat_id=chat_id,
+                    poll_result=poll_result,
+                    meeting_datetime=meeting_datetime
+                )
+                
+                if not success:
+                    logger.error("Failed to schedule follow-up message - database connection error")
+                
+            except Exception as e:
+                logger.error(f"Error scheduling follow-up task: {e}")
 
         except Exception as e:
             logger.error(f"Error scheduling follow-up message: {e}")
@@ -1426,23 +1595,13 @@ class SimplePollBot:
         except Exception as e:
             logger.error(f"Error sending follow-up message: {e}")
 
-    async def schedule_immediate_confirmation(self, chat_id, poll_result, context, poll_voters=None):
-        """Schedule immediate confirmation message 1 minute after poll is confirmed"""
-        try:
-            logger.info(
-                f"Scheduling immediate confirmation for chat {chat_id} in {IMMEDIATE_CONFIRMATION_DELAY} seconds")
-            await asyncio.sleep(IMMEDIATE_CONFIRMATION_DELAY)
-
-            # Send the immediate confirmation message
-            await self.send_immediate_confirmation_message(chat_id, poll_result, context, poll_voters)
-
-        except Exception as e:
-            logger.error(f"Error scheduling immediate confirmation: {e}")
-
-    async def send_immediate_confirmation_message(self, chat_id, poll_result, context, poll_voters=None):
+    async def send_confirmation_message(self, chat_id, poll_result, context, poll_voters=None):
         """Send immediate confirmation message with inline keyboard buttons"""
         try:
             confirmation_text = f"План в силе? 💪 {poll_result}"
+
+            # Playful slow-processing notice (processing might take a moment)
+            await context.bot.send_message(chat_id=chat_id, text="🤖 Бот иногда задумывается. Если кнопка не сработала сразу — дайте ему минутку-другую 😊")
 
             # Create inline keyboard for confirmation
             keyboard = [
@@ -1471,10 +1630,25 @@ class SimplePollBot:
                 'message_id': message.message_id,
                 'poll_result': poll_result,
                 'context': context,
-                'confirmed_users': set(),  # Users who confirmed "yes"
-                'declined_users': set(),  # Users who declined "no"
-                'all_voters': poll_voters or set()  # All users who voted in the original poll
+                'confirmed_users': set(),
+                'declined_users': set(),
+                'all_voters': poll_voters or set()
             }
+
+            # Persist immediate confirmation
+            try:
+                if upsert_immediate_confirmation:
+                    upsert_immediate_confirmation(
+                        chat_id=chat_id,
+                        message_id=message.message_id,
+                        poll_result=poll_result,
+                        poll_id=None,
+                        all_voters=poll_voters or set(),
+                        confirmed_users=set(),
+                        declined_users=set(),
+                    )
+            except Exception as e:
+                logger.warning(f"Could not persist immediate confirmation for chat {chat_id}: {e}")
 
             logger.info(
                 f"Sent immediate confirmation with inline keyboard: '{confirmation_text}' (ID: {immediate_conf_id})")
@@ -1482,170 +1656,42 @@ class SimplePollBot:
         except Exception as e:
             logger.error(f"Error sending immediate confirmation message: {e}")
 
-    async def send_confirmation_question(self, chat_id, all_members, context, poll_result):
-        """Send 'В силе?' confirmation question"""
-        try:
-            confirmation_text = f"План в силе? 💪 Отреагируйте👍 если идете! {poll_result}"
-
-            # Send the confirmation message
-            message = await context.bot.send_message(
-                chat_id=chat_id,
-                text=confirmation_text
-            )
-
-            # Track this confirmation message (simplified - no member tracking)
-            confirmation_id = f"{chat_id}_{message.message_id}"
-            self.confirmation_messages[confirmation_id] = {
-                'chat_id': chat_id,
-                'message_id': message.message_id,
-                'reactors': set(),
-                'context': context
-            }
-
-            logger.info(f"Sent confirmation question: '{confirmation_text}' with ID {confirmation_id}")
-
-            # Start monitoring reactions for 1 hour
-            asyncio.create_task(self.monitor_confirmation_reactions(confirmation_id))
-
-            logger.info(f"Sent confirmation question and started 1-hour monitoring")
-
-        except Exception as e:
-            logger.error(f"Error sending confirmation question: {e}")
-
-    async def monitor_confirmation_reactions(self, confirmation_id):
-        """Monitor reactions to confirmation message for 1 hour"""
-        try:
-            await asyncio.sleep(CONFIRMATION_REACTION_TIMEOUT)  # Wait 1 hour for reactions
-
-            if confirmation_id not in self.confirmation_messages:
-                logger.info(f"Confirmation {confirmation_id} was already cleaned up")
-                return
-
-            conf_data = self.confirmation_messages[confirmation_id]
-            reactors = conf_data['reactors']
-            chat_id = conf_data['chat_id']
-            context = conf_data['context']
-
-            logger.info(f"Confirmation {confirmation_id} timeout. Reactors: {len(reactors)}")
-
-            # Send general reminder since we don't track specific members
-            ping_message = "⏰ Время истекло! Отреагируйте на сообщение выше, пожалуйста!"
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=ping_message
-                )
-                logger.info(f"Sent general reaction reminder for confirmation {confirmation_id}")
-            except Exception as e:
-                logger.error(f"Error sending reaction reminder: {e}")
-
-            # Clean up confirmation data
-            if confirmation_id in self.confirmation_messages:
-                del self.confirmation_messages[confirmation_id]
-                logger.info(f"Cleaned up confirmation {confirmation_id} data")
-
-        except Exception as e:
-            logger.error(f"Error monitoring confirmation reactions: {e}")
-
-    async def message_reaction_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle message reactions"""
-        try:
-            reaction_update = update.message_reaction
-            chat_id = reaction_update.chat.id
-            message_id = reaction_update.message_id
-            user_id = reaction_update.user.id
-
-            confirmation_id = f"{chat_id}_{message_id}"
-
-            logger.info(f"Reaction received: chat_id={chat_id}, message_id={message_id}, user_id={user_id}")
-
-            # Check if this is a thumbs up reaction for proceed confirmation
-            for poll_id, poll_data in self.active_polls.items():
-                proceed_data = poll_data.get('proceed_confirmation')
-                if proceed_data and proceed_data['message_id'] == message_id:
-                    # Check if it's a thumbs up reaction
-                    new_reactions = reaction_update.new_reaction
-                    if new_reactions:
-                        for reaction in new_reactions:
-                            if hasattr(reaction, 'emoji') and reaction.emoji == '👍':
-                                proceed_data['thumbs_up_users'].add(user_id)
-                                logger.info(f"Added thumbs up from user {user_id} for poll {poll_id}")
-
-                                # Check if we have enough reactions now
-                                await self.check_thumbs_up_threshold(poll_id)
-                                return
-
-            # Handle regular confirmation reactions (for "В силе?" messages)
-            if confirmation_id in self.confirmation_messages:
-                # Add user to reactors
-                self.confirmation_messages[confirmation_id]['reactors'].add(user_id)
-                logger.info(f"Added user {user_id} to reactors for confirmation {confirmation_id}")
-                logger.info(f"Current reactors: {self.confirmation_messages[confirmation_id]['reactors']}")
-
-                # Check if everyone reacted
-                await self.check_if_everyone_reacted(confirmation_id)
-            else:
-                logger.info(f"Reaction to unknown confirmation message {confirmation_id}")
-
-        except Exception as e:
-            logger.error(f"Error handling message reaction: {e}")
-
-    async def check_if_everyone_reacted(self, confirmation_id):
-        """Check reactions to the confirmation message"""
-        try:
-            if confirmation_id not in self.confirmation_messages:
-                return
-
-            conf_data = self.confirmation_messages[confirmation_id]
-            reactors = conf_data['reactors']
-            chat_id = conf_data['chat_id']
-            context = conf_data['context']
-
-            # Just log the reaction count (no automatic completion since we don't track member count)
-            logger.info(f"Reaction received for confirmation {confirmation_id}. Total reactors: {len(reactors)}")
-
-        except Exception as e:
-            logger.error(f"Error checking reactions: {e}")
-
     async def monitor_poll_voting(self, poll_id):
-        """Monitor poll voting for 1 hour and ping non-voters"""
+        """Monitor poll voting for 1 hour and ping non-voters - now stores task in database"""
         logger.info(f"Starting 1-hour countdown for poll {poll_id}")
-        await asyncio.sleep(POLL_VOTING_TIMEOUT)  # Wait 1 hour
-
+        
+        # Get poll data to calculate missing votes
         if poll_id not in self.active_polls:
-            logger.info(f"Poll {poll_id} was already cleaned up")
-            return  # Poll was already cleaned up
-
+            logger.warning(f"Poll {poll_id} not found in active polls")
+            return
+            
         poll_data = self.active_polls[poll_id]
+        chat_id = poll_data['chat_id']
         vote_count = poll_data['vote_count']
         target_member_count = poll_data.get('target_member_count', 1)
-        chat_id = poll_data['chat_id']
-        context = poll_data['context']
-
-        logger.info(f"Poll {poll_id} timeout reached. Target members: {target_member_count}, Votes: {vote_count}")
-
-        # Send general reminder if not enough votes
-        if vote_count < target_member_count:
-            # Send general reminder message
+        
+        # Store poll voting timeout in database using scheduled tasks module
+        try:
+            from scheduled_tasks import ScheduledTaskManager
+            
+            # Store missing vote count for the reminder
             missing_votes = target_member_count - vote_count
-            ping_message = f"⏰ Ещё {missing_votes} человек не проголосовали. Проголосуйте, пожалуйста!"
-
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=ping_message
-                )
-                logger.info(f"Sent general reminder for poll {poll_id}: {missing_votes} votes missing")
-            except Exception as e:
-                logger.error(f"Error sending reminder message: {e}")
-
-            # Mark that reminder was sent but keep poll active
-            self.active_polls[poll_id]['reminder_sent'] = True
-            logger.info(f"Poll {poll_id} reminder sent, poll remains active for more votes")
-        else:
-            # Everyone has voted, proceed with poll resolution
-            logger.info(f"Poll {poll_id} - everyone voted after 1 hour, proceeding with resolution")
-            await self.check_if_everyone_voted(poll_id, context)
+            
+            success = ScheduledTaskManager.schedule_poll_voting_timeout(
+                chat_id=chat_id,
+                poll_id=poll_id,
+                missing_votes=missing_votes
+            )
+            
+            if not success:
+                logger.error(f"Poll voting timeout for {poll_id} cannot be scheduled - database connection error")
+            
+            return  # Exit function - reminder will be sent by scheduled task
+            
+        except Exception as e:
+            logger.error(f"Error scheduling poll voting timeout: {e}")
+            return
+    # Immediate reminder updates fully removed
 
     async def cleanup_expired_sessions(self):
         """Periodically clean up expired sessions"""
@@ -1675,12 +1721,37 @@ class SimplePollBot:
                 if expired_sessions:
                     logger.info(f"Cleaned up {len(expired_sessions)} expired sessions")
 
-                # Sleep for 1 hour before next cleanup
-                await asyncio.sleep(CLEANUP_INTERVAL)
+                # Store session cleanup task in database using scheduled tasks module
+                try:
+                    from scheduled_tasks import ScheduledTaskManager
+                    
+                    success = ScheduledTaskManager.schedule_session_cleanup()
+                    
+                    if not success:
+                        logger.error("Session cleanup cannot be scheduled - database connection error")
+                    
+                    break  # Exit the loop - next cleanup will be handled by scheduled task
+                    
+                except Exception as e:
+                    logger.error(f"Error scheduling session cleanup: {e}")
+                    break  # Exit the loop
 
             except Exception as e:
                 logger.error(f"Error in session cleanup: {e}")
-                await asyncio.sleep(CLEANUP_INTERVAL)  # Continue cleanup even if there's an error
+                # Store session cleanup task in database for error recovery
+                try:
+                    from scheduled_tasks import ScheduledTaskManager
+                    
+                    success = ScheduledTaskManager.schedule_session_cleanup()
+                    
+                    if not success:
+                        logger.error("Session cleanup cannot be scheduled after error - database connection error")
+                    
+                    break  # Exit the loop - next cleanup will be handled by scheduled task
+                    
+                except Exception as e:
+                    logger.error(f"Error scheduling session cleanup after error: {e}")
+                    break  # Exit the loop
 
     def is_session_valid(self, chat_id, user_id):
         """Check if a session is still valid"""
@@ -1787,81 +1858,21 @@ class SimplePollBot:
                 else:
                     await context.bot.send_message(chat_id=chat_id, text=cant_make_it_message, parse_mode='Markdown')
 
-            # Now ask if we should proceed without these users using thumbs up reactions
-            await self.ask_proceed_with_thumbs_up(poll_id, cant_make_it_users, context)
+            # Removed: thumbs up reactions - using inline keyboard buttons instead
+            # The poll will be resolved based on votes only
 
         except Exception as e:
             logger.error(f"Error handling can't make it users: {e}")
 
-    async def ask_proceed_with_thumbs_up(self, poll_id, cant_make_it_users, context):
-        """Ask if we should proceed without users who can't make it using thumbs up reactions"""
-        try:
-            if poll_id not in self.active_polls:
-                return
-
-            poll_data = self.active_polls[poll_id]
-            chat_id = poll_data['chat_id']
-
-            # Create message asking to proceed
-            if len(cant_make_it_users) == 1:
-                user_id = next(iter(cant_make_it_users))
-                # Get user mention
-                try:
-                    user_info = await context.bot.get_chat_member(chat_id, user_id)
-                    user = user_info.user
-                    if user.username:
-                        user_mention = f"@{user.username}"
-                    else:
-                        user_mention = user.first_name
-                except:
-                    user_mention = f"пользователь {user_id}"
-
-                proceed_message = f"Продолжаем без {user_mention}?"
-            else:
-                user_count = len(cant_make_it_users)
-                proceed_message = f"Продолжаем без {user_count} пользователей?"
-
-            # Create inline keyboard for confirmation
-            keyboard = [
-                [
-                    InlineKeyboardButton("👍 Да, продолжаем!", callback_data=f"proceed_yes_{poll_id}"),
-                    InlineKeyboardButton("❌ Нет, отменить", callback_data=f"proceed_no_{poll_id}")
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            # Send message with inline keyboard
-            proceed_msg = await context.bot.send_message(
-                chat_id=chat_id,
-                text=proceed_message,
-                reply_markup=reply_markup
-            )
-
-            # Calculate how many users need to respond (excluding can't make it users)
-            target_member_count = poll_data.get('target_member_count', 1)
-            users_who_can_attend = target_member_count - len(cant_make_it_users)
-
-            # Store proceed confirmation data
-            poll_data['proceed_confirmation'] = {
-                'message_id': proceed_msg.message_id,
-                'cant_make_it_users': cant_make_it_users,
-                'yes_votes': set(),
-                'no_votes': set(),
-                'required_responses': users_who_can_attend,
-                'start_time': datetime.now()
-            }
-
-            # Buttons remain available indefinitely (no timeout)
-
-            logger.info(f"Asked for thumbs up confirmation for poll {poll_id}")
-
-        except Exception as e:
-            logger.error(f"Error asking thumbs up confirmation: {e}")
+    # Removed: ask_proceed_with_thumbs_up function - no reaction tracking needed
 
     async def monitor_proceed_timeout(self, poll_id, timeout_seconds):
         """Monitor proceed confirmation timeout"""
         try:
-            await asyncio.sleep(timeout_seconds)
+            # DISABLED: asyncio.sleep not supported on PythonAnywhere
+            # Proceed confirmations now have no timeout and remain active indefinitely
+            logger.info(f"Proceed timeout monitoring disabled for poll {poll_id} (PythonAnywhere compatibility)")
+            return
 
             if poll_id not in self.active_polls:
                 return
@@ -1902,91 +1913,39 @@ class SimplePollBot:
         except Exception as e:
             logger.error(f"Error monitoring proceed timeout: {e}")
 
-    async def check_thumbs_up_threshold(self, poll_id):
-        """Check if enough thumbs up reactions have been received"""
-        try:
-            if poll_id not in self.active_polls:
-                return
-
-            poll_data = self.active_polls[poll_id]
-            proceed_data = poll_data.get('proceed_confirmation')
-
-            if not proceed_data:
-                return
-
-            chat_id = poll_data['chat_id']
-            cant_make_it_users = proceed_data['cant_make_it_users']
-            target_member_count = poll_data.get('target_member_count', 1)
-            thumbs_up_users = proceed_data['thumbs_up_users']
-
-            # Calculate how many users need to react (excluding can't make it users and the bot itself)
-            users_who_can_attend = target_member_count - len(cant_make_it_users)
-
-            # Get bot's own user ID to exclude it from reaction requirements
-            try:
-                bot_info = await poll_data['context'].bot.get_me()
-                bot_user_id = bot_info.id
-
-                # Check if bot is counted in the target member count and adjust
-                all_voters = set()
-                for voters in poll_data['vote_counts'].values():
-                    all_voters.update(voters)
-
-                if bot_user_id in all_voters:
-                    users_who_can_attend -= 1
-                    logger.info(f"Bot {bot_user_id} excluded from reaction requirements")
-
-            except Exception as e:
-                logger.warning(f"Could not get bot info: {e}")
-
-            # Ensure we don't require negative reactions
-            users_who_can_attend = max(0, users_who_can_attend)
-
-            logger.info(
-                f"Poll {poll_id}: {len(thumbs_up_users)} thumbs up, need {users_who_can_attend} from users who can attend")
-
-            if len(thumbs_up_users) >= users_who_can_attend:
-                # Enough thumbs up - proceed with resolution
-                logger.info(f"Proceeding with poll {poll_id} - {len(thumbs_up_users)} thumbs up received")
-
-                proceed_message = f"👍 Получено {len(thumbs_up_users)} одобрений! Планируем встречу для остальных."
-                await poll_data['context'].bot.send_message(
-                    chat_id=chat_id,
-                    text=proceed_message
-                )
-
-                # Proceed with resolution excluding can't make it users
-                await self.resolve_poll_excluding_cant_make_it(poll_id, poll_data['context'])
-
-                # Clean up proceed confirmation data
-                if 'proceed_confirmation' in poll_data:
-                    del poll_data['proceed_confirmation']
-
-        except Exception as e:
-            logger.error(f"Error checking thumbs up threshold: {e}")
+    # Removed: check_thumbs_up_threshold function - no reaction tracking needed
 
     async def handle_proceed_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
         """Handle proceed confirmation buttons"""
         query = update.callback_query
         user_id = update.effective_user.id
 
-        # Extract action and identifier from callback data
-        parts = data.split('_')
-        action = parts[1]  # 'yes' or 'no'
+        # Decide which flow to use (immediate confirmation vs regular proceed)
+        # Immediate confirmation pattern: proceed_yes_<chat_id>_<timestamp> or proceed_no_<chat_id>_<timestamp>
+        try:
+            import re
+            m = re.match(r"^proceed_(yes|no)_(-?\d+)_(\d+)$", data)
+            if m:
+                action = m.group(1)
+                chat_id = int(m.group(2))
+                # timestamp = m.group(3)  # not used, but validates format
+                await self.handle_immediate_confirmation_button(action, chat_id, user_id, query, context)
+                return
+        except Exception:
+            pass
 
-        # Check if this is an immediate confirmation (has timestamp) or regular proceed (has poll_id)
-        if len(parts) >= 4 and parts[3].isdigit():
-            # This is an immediate confirmation: proceed_yes_chatid_timestamp or proceed_no_chatid_timestamp
-            chat_id = int(parts[2])
-            timestamp = parts[3]
-            await self.handle_immediate_confirmation_button(action, chat_id, user_id, query, context)
-        else:
-            # This is a regular proceed button: proceed_yes_pollid or proceed_no_pollid
-            poll_id = '_'.join(parts[2:])  # rest is poll_id
+        # Regular proceed pattern: proceed_yes_<poll_id> or proceed_no_<poll_id>
+        parts = data.split('_', 2)
+        if len(parts) >= 3 and parts[0] == 'proceed' and parts[1] in ('yes', 'no'):
+            action = parts[1]
+            poll_id = parts[2]
             if action == 'yes':
                 await self.handle_proceed_yes(poll_id, user_id, query, context)
             else:
                 await self.handle_proceed_no(poll_id, user_id, query, context)
+        else:
+            # Unknown format; ignore gracefully
+            await query.answer("Некорректные данные кнопки", show_alert=True)
 
     async def handle_immediate_confirmation_button(self, action, chat_id, user_id, query, context):
         """Handle immediate confirmation buttons (yes/no for 'План в силе?')"""
@@ -2031,6 +1990,23 @@ class SimplePollBot:
 
             # Update the message to show disabled buttons for this user
             await self.update_immediate_confirmation_buttons(immediate_conf_id, user_id, context)
+
+            # Persist updated immediate confirmation
+            try:
+                if upsert_immediate_confirmation:
+                    stored = get_immediate_confirmation(chat_id, query.message.message_id)
+                    all_voters = stored['all_voters'] if stored else immediate_conf_data.get('all_voters', set())
+                    upsert_immediate_confirmation(
+                        chat_id=chat_id,
+                        message_id=query.message.message_id,
+                        poll_result=immediate_conf_data.get('poll_result', ''),
+                        poll_id=None,
+                        all_voters=all_voters,
+                        confirmed_users=immediate_conf_data['confirmed_users'],
+                        declined_users=immediate_conf_data['declined_users'],
+                    )
+            except Exception as e:
+                logger.warning(f"Could not persist updated immediate confirmation: {e}")
 
             # Check if everyone who voted in the original poll has confirmed "yes"
             await self.check_if_everyone_confirmed(immediate_conf_id, context)
@@ -2095,6 +2071,7 @@ class SimplePollBot:
 
         except Exception as e:
             logger.error(f"Error checking if everyone confirmed: {e}")
+    
 
     async def handle_proceed_yes(self, poll_id, user_id, query, context):
         """Handle proceed yes button"""
@@ -2422,8 +2399,8 @@ class SimplePollBot:
                 playful_message = "Никто не может прийти на встречу! 😅 Попробуйте создать новый опрос с другими вариантами времени.\n\nИспользуйте /create_poll"
                 await context.bot.send_message(chat_id=chat_id, text=playful_message)
 
-                # Close poll and clean up
-                await self.close_poll_and_clean_up(poll_id, context)
+                # Close poll and clean up (everyone effectively voted 'Не могу')
+                await self.close_poll_and_clean_up(poll_id, context, cancel_voting_timeout=True)
                 return
 
             # Apply resolution logic to filtered votes
@@ -2532,14 +2509,10 @@ class SimplePollBot:
                     except Exception as e:
                         logger.warning(f"Could not get bot info to exclude from voters: {e}")
 
-            # Schedule immediate confirmation (1 minute after poll is confirmed)
-            immediate_confirmation_task = asyncio.create_task(
-                self.schedule_immediate_confirmation(chat_id, option, context, poll_voters))
-
             # Schedule reminders
             confirmation_task = asyncio.create_task(
-                self.schedule_confirmation_question(poll_id, chat_id, set(), context, option))
-            unpin_task = asyncio.create_task(self.schedule_unpin_message(poll_id, chat_id, context, option))
+                self.schedule_confirmation_message(poll_id, chat_id, context, option, poll_voters))
+            unpin_task = asyncio.create_task(self.schedule_unpin_message(poll_id, chat_id, context, option, sent_message.message_id))
             followup_task = asyncio.create_task(self.schedule_followup_message(chat_id, context, option))
 
             # Track scheduled tasks for this chat
@@ -2555,6 +2528,11 @@ class SimplePollBot:
             try:
                 poll_message_id = poll_data['poll_message_id']
                 await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                try:
+                    if set_poll_closed:
+                        set_poll_closed(poll_id, True)
+                except Exception as e:
+                    logger.warning(f"DB set_poll_closed failed for {poll_id}: {e}")
                 logger.info(f"Closed poll {poll_id} after meeting confirmation")
             except Exception as e:
                 logger.warning(f"Could not close poll {poll_id}: {e}")
@@ -2579,6 +2557,11 @@ class SimplePollBot:
             try:
                 poll_message_id = poll_data['poll_message_id']
                 await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                try:
+                    if set_poll_closed:
+                        set_poll_closed(poll_id, True)
+                except Exception as e:
+                    logger.warning(f"DB set_poll_closed failed for {poll_id}: {e}")
                 logger.info(f"Closed poll {poll_id} - no common option")
             except Exception as e:
                 logger.warning(f"Could not close poll {poll_id}: {e}")
@@ -2594,8 +2577,10 @@ class SimplePollBot:
         except Exception as e:
             logger.error(f"Error closing poll and suggesting new: {e}")
 
-    async def close_poll_and_clean_up(self, poll_id, context):
-        """Close poll and clean up without suggesting new poll"""
+    async def close_poll_and_clean_up(self, poll_id, context, cancel_voting_timeout: bool = False):
+        """Close poll and clean up without suggesting new poll.
+        If cancel_voting_timeout is True, unschedule poll_voting_timeout tasks for this chat.
+        """
         try:
             if poll_id not in self.active_polls:
                 return
@@ -2607,9 +2592,23 @@ class SimplePollBot:
             try:
                 poll_message_id = poll_data['poll_message_id']
                 await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                try:
+                    if set_poll_closed:
+                        set_poll_closed(poll_id, True)
+                except Exception as e:
+                    logger.warning(f"DB set_poll_closed failed for {poll_id}: {e}")
                 logger.info(f"Closed poll {poll_id} - everyone voted 'Не могу'")
             except Exception as e:
                 logger.warning(f"Could not close poll {poll_id}: {e}")
+
+            # Unschedule voting timeout tasks only if explicitly requested
+            if cancel_voting_timeout:
+                try:
+                    from task_storage import cancel_chat_tasks
+                    cancelled = cancel_chat_tasks(chat_id, task_type="poll_voting_timeout")
+                    logger.info(f"Cancelled {cancelled} 'poll_voting_timeout' tasks for chat {chat_id}")
+                except Exception as e:
+                    logger.warning(f"Could not cancel voting timeout tasks for chat {chat_id}: {e}")
 
             # Clean up poll data
             self.cleanup_poll_data(poll_id)
@@ -2679,15 +2678,32 @@ class SimplePollBot:
                         except Exception as e:
                             logger.warning(f"Could not get bot info to exclude from voters: {e}")
 
-                # Schedule immediate confirmation (1 minute after poll is confirmed)
-                immediate_confirmation_task = asyncio.create_task(
-                    self.schedule_immediate_confirmation(chat_id, proposed_option, context, poll_voters))
-
                 # Schedule reminders for the proposed meeting
                 confirmation_task = asyncio.create_task(
-                    self.schedule_confirmation_question(poll_id, chat_id, set(), context, proposed_option))
-                unpin_task = asyncio.create_task(
-                    self.schedule_unpin_message(poll_id, chat_id, context, proposed_option))
+                    self.schedule_confirmation_message(poll_id, chat_id, context, proposed_option, poll_voters))
+                
+                # Schedule unpin message using ScheduledTaskManager
+                try:
+                    from scheduled_tasks import ScheduledTaskManager
+                    from datetime import datetime
+                    
+                    # Parse the proposed option to get meeting datetime
+                    meeting_datetime = self.parse_meeting_time(proposed_option)
+                    if meeting_datetime:
+                        ScheduledTaskManager.schedule_unpin_message(
+                            chat_id=chat_id,
+                            poll_id=poll_id,
+                            meeting_datetime=meeting_datetime,
+                            message_id=sent_message.message_id
+                        )
+                        logger.info(f"Scheduled unpin task for meeting at {meeting_datetime}")
+                    else:
+                        logger.warning(f"Could not parse meeting time from: {proposed_option}")
+                except ImportError:
+                    logger.warning("ScheduledTaskManager not available - unpin task not scheduled")
+                except Exception as e:
+                    logger.error(f"Error scheduling unpin task: {e}")
+                
                 followup_task = asyncio.create_task(self.schedule_followup_message(chat_id, context, proposed_option))
 
                 # Track scheduled tasks for this chat
@@ -2695,9 +2711,9 @@ class SimplePollBot:
                     self.scheduled_tasks[chat_id] = []
                 self.scheduled_tasks[chat_id].extend([
                     {'task': confirmation_task, 'type': 'confirmation', 'poll_id': poll_id},
-                    {'task': unpin_task, 'type': 'unpin', 'poll_id': poll_id},
                     {'task': followup_task, 'type': 'followup', 'poll_id': poll_id}
                 ])
+                # Note: unpin task is now handled by ScheduledTaskManager, not asyncio
 
                 await query.edit_message_text(
                     f"✅ Встреча запланирована: {proposed_option}\n📌 Сообщение закреплено и напоминания настроены!")
@@ -2706,6 +2722,11 @@ class SimplePollBot:
                 try:
                     poll_message_id = poll_data['poll_message_id']
                     await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                    try:
+                        if set_poll_closed:
+                            set_poll_closed(poll_id, True)
+                    except Exception as e:
+                        logger.warning(f"DB set_poll_closed failed for {poll_id}: {e}")
                     logger.info(f"Closed poll {poll_id} after proposal confirmation")
                 except Exception as e:
                     logger.warning(f"Could not close poll {poll_id}: {e}")
@@ -2743,10 +2764,13 @@ def main():
     app.add_handler(CommandHandler("create_poll", bot.create_poll))
     app.add_handler(CommandHandler("cancel_bot", bot.cancel_bot))
     app.add_handler(CommandHandler("die", bot.die_command))
+    app.add_handler(CommandHandler("subscribe", handle_subscribe))
+    app.add_handler(CommandHandler("unsubscribe", handle_unsubscribe))
+    app.add_handler(CommandHandler("subscribers", handle_subscribers_count))
     app.add_handler(CallbackQueryHandler(bot.button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.text_handler))
     app.add_handler(PollAnswerHandler(bot.poll_answer_handler))
-    app.add_handler(MessageReactionHandler(bot.message_reaction_handler))
+    # Removed: MessageReactionHandler - no reaction tracking needed
 
     print("✅ Simple Poll Bot is running...")
     print("⏹️  Press Ctrl+C to stop")

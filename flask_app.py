@@ -98,6 +98,7 @@ logger = logging.getLogger(__name__)
 # Flask app
 app = Flask(__name__)
 
+# Optional outbound message tracing for integration testing (removed)
 # Authentication setup
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')  # fallback to 'admin' if not set
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')  # No fallback - must be set in .env
@@ -183,15 +184,27 @@ async def initialize_bot_async():
         bot_application.add_handler(CommandHandler("create_poll", bot_instance.create_poll))
         bot_application.add_handler(CommandHandler("cancel_bot", bot_instance.cancel_bot))
         bot_application.add_handler(CommandHandler("die", bot_instance.die_command))
+        
+        # Import and add subscribe handlers
+        try:
+            from subscribe_handler import handle_subscribe, handle_unsubscribe, handle_subscribers_count
+            bot_application.add_handler(CommandHandler("subscribe", handle_subscribe))
+            bot_application.add_handler(CommandHandler("unsubscribe", handle_unsubscribe))
+            bot_application.add_handler(CommandHandler("subscribers", handle_subscribers_count))
+            logger.info("✅ Subscribe handlers added successfully")
+        except ImportError as e:
+            logger.warning(f"⚠️ Could not import subscribe handlers: {e}")
+        
         bot_application.add_handler(CallbackQueryHandler(bot_instance.button_handler))
         bot_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_instance.text_handler))
         bot_application.add_handler(PollAnswerHandler(bot_instance.poll_answer_handler))
-        bot_application.add_handler(MessageReactionHandler(bot_instance.message_reaction_handler))
+        # Removed: MessageReactionHandler - no reaction tracking needed
 
         # Start the cleanup task
         bot_instance.start_cleanup_task()
 
         logger.info("✅ Bot setup completed successfully")
+        
         return True
 
     except Exception as e:
@@ -503,6 +516,7 @@ def login_info():
 # Initialize lazily when first endpoint is called
 
 # For PythonAnywhere, the app will be imported, not run directly
+
 if __name__ == "__main__":
     # Development mode - run Flask app only
     # Use /start_polling endpoint or webhook for bot functionality
@@ -516,3 +530,217 @@ if __name__ == "__main__":
 
     # Run Flask app
     app.run(debug=True, host='0.0.0.0', port=5000)
+
+
+@app.route('/run_scheduled_tasks', methods=['POST'])
+@requires_auth
+def run_scheduled_tasks():
+    """Execute due scheduled tasks - called by PythonAnywhere scheduled task"""
+    try:
+        # Import task storage module
+        try:
+            from task_storage import get_due_tasks, mark_task_executed
+        except ImportError:
+            logger.error("task_storage module not found")
+            return jsonify({"error": "task_storage module not available"}), 500
+        
+        if not ensure_bot_setup():
+            return jsonify({"error": "Bot not configured"}), 500
+        
+        # Get tasks that are due for execution
+        due_tasks = get_due_tasks()
+        
+        if not due_tasks:
+            logger.info("No due tasks found")
+            return jsonify({
+                "status": "success",
+                "message": "No due tasks to execute",
+                "tasks_executed": 0
+            })
+        
+        executed_count = 0
+        errors = []
+        
+        # Process each due task
+        for task in due_tasks:
+            try:
+                task_id = task['id']
+                chat_id = task['chat_id']
+                poll_id = task['poll_id']
+                task_type = task['task_type']
+                task_data = task['task_data']
+                
+                logger.info(f"Executing task {task_id}: {task_type} for chat {chat_id}")
+                
+                # Execute task based on type
+                loop = get_or_create_event_loop()
+                
+                if task_type == 'confirmation':
+                    # Send "План в силе?" confirmation message with buttons
+                    loop.run_until_complete(
+                        send_confirmation_task(chat_id, task_data, poll_id)
+                    )
+                    
+                elif task_type == 'followup':
+                    # Send follow-up question about how the meeting went
+                    loop.run_until_complete(
+                        send_followup_task(chat_id, task_data)
+                    )
+                    
+                elif task_type == 'unpin_message':
+                    # Unpin the meeting confirmation message
+                    message_id = int(task_data) if task_data and task_data.isdigit() else None
+                    loop.run_until_complete(
+                        unpin_message_task(chat_id, message_id)
+                    )
+                    
+                elif task_type == 'poll_voting_timeout':
+                    # Send reminder for non-voters (1 hour timeout)
+                    loop.run_until_complete(
+                        send_voting_reminder_task(chat_id, poll_id, task_data)
+                    )
+                    
+                elif task_type == 'session_cleanup':
+                    # Clean up expired sessions
+                    loop.run_until_complete(
+                        cleanup_sessions_task()
+                    )
+                    
+                else:
+                    logger.warning(f"Unknown task type: {task_type}")
+                    errors.append(f"Unknown task type: {task_type} for task {task_id}")
+                    continue
+                
+                # Mark task as executed
+                mark_task_executed(task_id)
+                executed_count += 1
+                
+                logger.info(f"Successfully executed task {task_id}")
+                
+            except Exception as e:
+                error_msg = f"Error executing task {task.get('id', 'unknown')}: {str(e)}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+                continue
+        
+        # Return execution summary
+        result = {
+            "status": "success",
+            "message": f"Executed {executed_count} of {len(due_tasks)} due tasks",
+            "tasks_executed": executed_count,
+            "total_due_tasks": len(due_tasks)
+        }
+        
+        if errors:
+            result["errors"] = errors
+            result["status"] = "partial_success"
+        
+        logger.info(f"Task execution completed: {executed_count}/{len(due_tasks)} successful")
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error in run_scheduled_tasks: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# Import the centralized task execution functions
+try:
+    from scheduled_tasks import TaskExecutor
+    task_executor_available = True
+except ImportError:
+    logger.error("scheduled_tasks module not available")
+    task_executor_available = False
+
+# Task execution helper functions
+
+async def send_confirmation_task(chat_id: int, poll_result: str, poll_id: str):
+    """Send confirmation message using centralized task executor"""
+    if not task_executor_available:
+        raise Exception("Task executor not available")
+    
+    await TaskExecutor.execute_confirmation_task(chat_id, poll_result, poll_id, bot_instance, bot_application)
+
+
+async def send_followup_task(chat_id: int, poll_result: str):
+    """Send follow-up question about meeting if no open poll exists in this chat (DB-checked)."""
+    try:
+        # DB check: skip if there is any open poll for this chat
+        try:
+            from poll_storage import get_open_polls
+            open_polls = get_open_polls() or []
+            if any(int(p.get('chat_id')) == int(chat_id) for p in open_polls):
+                logger.info(f"Skipping follow-up in chat {chat_id}: open poll found in DB")
+                return
+        except Exception as db_err:
+            logger.warning(f"Could not verify open polls from DB before follow-up: {db_err}")
+            # Best-effort: continue to in-memory check
+            try:
+                if bot_instance and getattr(bot_instance, 'active_polls', None):
+                    if any((p.get('chat_id') == chat_id) for p in bot_instance.active_polls.values()):
+                        logger.info(f"Skipping follow-up in chat {chat_id}: active poll detected in memory")
+                        return
+            except Exception:
+                pass
+
+        followup_text = (
+            "🔄 Как прошла встреча? Готовы планировать следующую?\n\n"
+            "Используйте /create_poll чтобы создать новый опрос для следующей встречи!"
+        )
+        
+        await bot_application.bot.send_message(
+            chat_id=chat_id,
+            text=followup_text
+        )
+        
+        logger.info(f"Sent follow-up message to chat {chat_id}")
+        
+    except Exception as e:
+        logger.error(f"Error sending follow-up to chat {chat_id}: {e}")
+        raise
+
+
+async def unpin_message_task(chat_id: int, message_id: int = None):
+    """Unpin meeting confirmation message"""
+    try:
+        if message_id:
+            await bot_application.bot.unpin_chat_message(
+                chat_id=chat_id,
+                message_id=message_id
+            )
+            logger.info(f"Unpinned message {message_id} in chat {chat_id}")
+        else:
+            # Unpin all messages if no specific message ID
+            await bot_application.bot.unpin_all_chat_messages(chat_id=chat_id)
+            logger.info(f"Unpinned all messages in chat {chat_id}")
+        
+    except Exception as e:
+        logger.error(f"Error unpinning message in chat {chat_id}: {e}")
+        raise
+
+
+async def send_voting_reminder_task(chat_id: int, poll_id: str, task_data: str):
+    """Send reminder for poll voting timeout (1-hour scheduled task) via DB-backed executor only"""
+    try:
+        # Delegate to TaskExecutor. It enforces that missing_votes payload exists.
+        from scheduled_tasks import TaskExecutor
+        await TaskExecutor.execute_voting_timeout_task(chat_id, poll_id, task_data, bot_application)
+        logger.info(f"Sent scheduled voting reminder to chat {chat_id} via TaskExecutor")
+    except Exception as e:
+        logger.error(f"Error sending voting reminder to chat {chat_id}: {e}")
+        raise
+
+
+async def cleanup_sessions_task():
+    """Clean up expired sessions"""
+    try:
+        if bot_instance:
+            if hasattr(bot_instance, 'cleanup_expired_sessions'):
+                logger.info("Running session cleanup task")
+            else:
+                logger.info("Session cleanup method not available")
+        else:
+            logger.warning("Bot instance not available for session cleanup")
+        
+    except Exception as e:
+        logger.error(f"Error in session cleanup: {e}")
+        raise
