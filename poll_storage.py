@@ -52,15 +52,16 @@ def upsert_poll(poll_id: str, chat_id: int, question: str, options: List[str], c
             """
             INSERT INTO polls (poll_id, chat_id, question, options_json, creator_id, poll_message_id, target_member_count, pinned_message_id, is_closed)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            AS new
             ON DUPLICATE KEY UPDATE
-              chat_id = VALUES(chat_id),
-              question = VALUES(question),
-              options_json = VALUES(options_json),
-              creator_id = VALUES(creator_id),
-              poll_message_id = VALUES(poll_message_id),
-              target_member_count = VALUES(target_member_count),
-              pinned_message_id = VALUES(pinned_message_id),
-              is_closed = VALUES(is_closed)
+              chat_id = new.chat_id,
+              question = new.question,
+              options_json = new.options_json,
+              creator_id = new.creator_id,
+              poll_message_id = new.poll_message_id,
+              target_member_count = new.target_member_count,
+              pinned_message_id = new.pinned_message_id,
+              is_closed = new.is_closed
             """,
             (poll_id, chat_id, question, json.dumps(options, ensure_ascii=False), creator_id,
              poll_message_id, target_member_count, pinned_message_id, is_closed)
@@ -110,31 +111,6 @@ def get_open_polls() -> List[Dict[str, Any]]:
 # Votes
 
 
-def get_polls_with_pins_by_chat(chat_id: int) -> List[Dict[str, Any]]:
-    """Return polls in given chat that have a pinned message id set."""
-    conn = get_db_connection()
-    cur = conn.cursor(dictionary=True)
-    try:
-        cur.execute(
-            "SELECT poll_id, pinned_message_id FROM polls WHERE chat_id=%s AND pinned_message_id IS NOT NULL",
-            (chat_id,)
-        )
-        rows = cur.fetchall() or []
-        return rows
-    finally:
-        cur.close(); conn.close()
-
-
-def clear_pinned_message_id(poll_id: str) -> None:
-    """Clear pinned_message_id for a poll after unpinning in chat."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("UPDATE polls SET pinned_message_id=NULL WHERE poll_id=%s", (poll_id,))
-    finally:
-        cur.close(); conn.close()
-
-
 def upsert_vote(poll_id: str, user_id: int, option_ids: List[int]) -> None:
     conn = get_db_connection()
     cur = conn.cursor()
@@ -143,7 +119,8 @@ def upsert_vote(poll_id: str, user_id: int, option_ids: List[int]) -> None:
             """
             INSERT INTO poll_votes (poll_id, user_id, option_ids_json)
             VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE option_ids_json = VALUES(option_ids_json)
+            AS new
+            ON DUPLICATE KEY UPDATE option_ids_json = new.option_ids_json
             """,
             (poll_id, user_id, json.dumps(option_ids))
         )

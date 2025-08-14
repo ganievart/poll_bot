@@ -269,11 +269,6 @@ async def handle_subscribers_count(update: Update, context: ContextTypes.DEFAULT
     """Wrapper function for subscribers count command"""
     await subscribe_handler.subscribers_count_command(update, context)
 
-# Example usage functions
-async def send_broadcast(context: ContextTypes.DEFAULT_TYPE, message: str):
-    """Send broadcast message to all subscribers"""
-    return await subscribe_handler.broadcast_message(context, message)
-
 def get_all_subscribers():
     """Get list of all subscriber IDs"""
     return subscribe_handler.get_subscribers()

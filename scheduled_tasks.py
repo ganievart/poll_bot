@@ -89,17 +89,16 @@ class ScheduledTaskManager:
             # Convert to naive UTC datetime for MySQL storage
             confirmation_datetime_utc_naive = confirmation_datetime_utc.replace(tzinfo=None)
 
-            # Create task data with Polish time info for human readability
+            # Store only the poll result as task data (keep logs for debug)
             polish_time_str = confirmation_datetime.strftime('%d.%m.%Y %H:%M')
             meeting_polish_str = meeting_datetime.strftime('%d.%m.%Y %H:%M')
-            task_data_with_time = f"{poll_result} | Confirmation at: {polish_time_str} (Polish) | Meeting at: {meeting_polish_str} (Polish)"
 
             task_id = add_scheduled_task(
                 chat_id=chat_id,
                 poll_id=poll_id,
                 task_type="confirmation",
                 scheduled_time=confirmation_datetime_utc_naive,
-                task_data=task_data_with_time
+                task_data=poll_result
             )
 
             logger.info(f"Stored confirmation task {task_id} in database:")
@@ -303,10 +302,87 @@ class TaskExecutor:
         """Execute confirmation message task"""
         try:
             if bot_instance:
-                await bot_instance.send_confirmation_message(chat_id, poll_result, bot_application, None)
+                # Reconstruct poll_voters from DB so that 'everyone confirmed' can be detected
+                poll_voters = set()
+                try:
+                    if poll_id:
+                        from poll_storage import get_votes, get_poll
+                        poll = get_poll(poll_id)
+                        options = poll.get('options', []) if poll else []
+                        # Try to find the selected option index based on poll_result
+                        selected_idx = None
+                        try:
+                            normalized_result = (poll_result or '').strip()
+                            for i, opt in enumerate(options):
+                                if (opt or '').strip() == normalized_result:
+                                    selected_idx = i
+                                    break
+                        except Exception:
+                            selected_idx = None
+                        votes_by_user = get_votes(poll_id) or {}
+                        # If selected option index found, collect voters who voted for it
+                        if selected_idx is not None:
+                            for uid_str, option_ids in votes_by_user.items():
+                                try:
+                                    if selected_idx in option_ids:
+                                        poll_voters.add(int(uid_str))
+                                except Exception:
+                                    continue
+                        else:
+                            # Fallback: include all voters who voted for any option except 'Не могу 😔'
+                            cant_idx = None
+                            for i, opt in enumerate(options):
+                                if opt == 'Не могу 😔':
+                                    cant_idx = i
+                                    break
+                            for uid_str, option_ids in votes_by_user.items():
+                                try:
+                                    # Include if they voted for any non-cant option
+                                    if any((idx != cant_idx) for idx in option_ids):
+                                        poll_voters.add(int(uid_str))
+                                except Exception:
+                                    continue
+                        # Exclude the bot account itself if present
+                        try:
+                            me = await bot_application.bot.get_me()
+                            poll_voters.discard(me.id)
+                        except Exception:
+                            pass
+                except Exception as db_err:
+                    logger.warning(f"Could not reconstruct poll voters for {poll_id}: {db_err}")
+                    poll_voters = set()
+
+                await bot_instance.send_confirmation_message(chat_id, poll_result, bot_application, poll_voters if poll_voters else None, poll_id=poll_id)
             else:
-                # Fallback: send simple message
-                confirmation_text = f"План в силе? 💪 {poll_result}"
+                # Fallback: format message with 'Сегодня/Завтра' prefix and trimmed time if today
+                try:
+                    meeting_dt = parse_meeting_datetime_from_poll_result(poll_result)
+                    prefix = ""
+                    if meeting_dt is not None:
+                        try:
+                            from zoneinfo import ZoneInfo
+                            polish_tz = ZoneInfo("Europe/Warsaw")
+                        except ImportError:
+                            import pytz
+                            polish_tz = pytz.timezone("Europe/Warsaw")
+                        now_pl = datetime.now(polish_tz)
+                        if meeting_dt.date() == now_pl.date():
+                            prefix = "Сегодня "
+                        elif meeting_dt.date() == (now_pl.date() + timedelta(days=1)):
+                            prefix = "Завтра "
+                    # Extract clean meeting label
+                    import re
+                    meeting_label = poll_result
+                    m = re.search(r"[А-ЯA-ZЁ][а-яa-zё]+\s*\(\d{2}\.\d{2}\)(?:\s+в\s+\d{1,2}:\d{2})?", poll_result)
+                    if m:
+                        meeting_label = m.group(0)
+                    # Trim time if today
+                    meeting_text = meeting_label
+                    if prefix.strip() == "Сегодня":
+                        meeting_text = re.sub(r"\s+в\s+\d{1,2}:\d{2}$", "", meeting_label)
+                    confirmation_text = f"{prefix}План в силе? 💪 {meeting_text}"
+                except Exception:
+                    confirmation_text = f"План в силе? 💪 {poll_result}"
                 await bot_application.bot.send_message(chat_id=chat_id, text=confirmation_text)
             
             logger.info(f"Executed confirmation task for chat {chat_id}")
@@ -315,67 +391,7 @@ class TaskExecutor:
             logger.error(f"Error executing confirmation task for chat {chat_id}: {e}")
             raise
     
-    @staticmethod
-    async def execute_followup_task(chat_id: int, poll_result: str, bot_instance, bot_application):
-        """Execute follow-up message task. Skip if a poll is already open in this chat."""
-        try:
-            # 1) Check in-memory active polls (preferred)
-            try:
-                if bot_instance and getattr(bot_instance, 'active_polls', None):
-                    if any((p.get('chat_id') == chat_id) for p in bot_instance.active_polls.values()):
-                        logger.info(f"Skipping follow-up in chat {chat_id}: active poll detected")
-                        return
-            except Exception as _:
-                pass
-
-            # 2) Check DB for open polls as a secondary safeguard
-            try:
-                from poll_storage import get_open_polls
-                open_polls = get_open_polls() or []
-                if any(int(p.get('chat_id')) == int(chat_id) for p in open_polls):
-                    logger.info(f"Skipping follow-up in chat {chat_id}: open poll found in DB")
-                    return
-            except Exception:
-                # If DB check fails, proceed with caution (best-effort)
-                pass
-
-            # No active/open poll → send follow-up
-            if bot_instance:
-                await bot_instance.send_followup_message(chat_id, bot_application)
-            else:
-                # Fallback: send simple message
-                followup_text = (
-                    "🔄 Как прошла встреча? Готовы планировать следующую?\n\n"
-                    "Используйте /create_poll чтобы создать новый опрос для следующей встречи!"
-                )
-                await bot_application.bot.send_message(chat_id=chat_id, text=followup_text)
-            
-            logger.info(f"Executed follow-up task for chat {chat_id}")
-            
-        except Exception as e:
-            logger.error(f"Error executing follow-up task for chat {chat_id}: {e}")
-            raise
     
-    @staticmethod
-    async def execute_unpin_task(chat_id: int, message_id_str: Optional[str], bot_instance, bot_application):
-        """Execute unpin message task"""
-        try:
-            message_id = int(message_id_str) if message_id_str and message_id_str.isdigit() else None
-            
-            if bot_instance and hasattr(bot_instance, 'unpin_confirmation_message'):
-                await bot_instance.unpin_confirmation_message(None, chat_id, bot_application)
-            else:
-                # Fallback: direct API call
-                if message_id:
-                    await bot_application.bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
-                else:
-                    await bot_application.bot.unpin_all_chat_messages(chat_id=chat_id)
-            
-            logger.info(f"Executed unpin task for chat {chat_id}")
-            
-        except Exception as e:
-            logger.error(f"Error executing unpin task for chat {chat_id}: {e}")
-            raise
     
     @staticmethod
     async def execute_voting_timeout_task(chat_id: int, poll_id: str, missing_votes_str: str, bot_application):
@@ -391,6 +407,20 @@ class TaskExecutor:
             if missing_votes is None:
                 logger.error("DB task missing 'missing_votes' payload; cannot send reminder")
                 raise RuntimeError("DB task missing 'missing_votes'")
+
+            # Guard: skip reminder if poll is closed or missing in DB
+            try:
+                from poll_storage import get_poll
+                poll = get_poll(poll_id)
+                if not poll:
+                    logger.info(f"Skipping voting timeout: poll {poll_id} not found in DB")
+                    return
+                if poll.get('is_closed'):
+                    logger.info(f"Skipping voting timeout: poll {poll_id} is already closed")
+                    return
+            except Exception as db_err:
+                # If DB check fails, proceed cautiously but log
+                logger.warning(f"Could not verify poll status from DB: {db_err}")
 
             import random
 
@@ -410,20 +440,6 @@ class TaskExecutor:
             logger.error(f"Error executing voting timeout task for chat {chat_id}: {e}")
             raise
     
-    @staticmethod
-    async def execute_session_cleanup_task(bot_instance):
-        """Execute session cleanup task"""
-        try:
-            if bot_instance and hasattr(bot_instance, 'cleanup_expired_sessions'):
-                # Note: This would normally run the cleanup once instead of continuous loop
-                logger.info("Session cleanup task executed")
-            else:
-                logger.info("Session cleanup not available or not needed")
-            
-        except Exception as e:
-            logger.error(f"Error executing session cleanup task: {e}")
-            raise
-
 
 def parse_meeting_datetime_from_poll_result(poll_result: str) -> Optional[datetime]:
     """

@@ -107,8 +107,11 @@ try:
             get_votes,
         )
     except ImportError:
-        upsert_poll = set_poll_closed = get_poll = upsert_vote = get_votes = upsert_immediate_confirmation = get_immediate_confirmation = None
+        upsert_poll = set_poll_closed = get_poll = upsert_vote = get_votes = None
         logger.warning("poll_storage not available; state will not persist across restarts")
+    # Placeholders for removed immediate confirmation storage functions
+    upsert_immediate_confirmation = None
+    get_immediate_confirmation = None
 except ImportError:
     print("❌ python-telegram-bot not installed!")
     print("📝 Install it with: py -m pip install python-telegram-bot")
@@ -364,6 +367,43 @@ class SimplePollBot:
         """Start poll creation"""
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
+
+        # Ensure bot has admin rights in group/supergroup to be able to pin/unpin messages
+        try:
+            chat_type = update.effective_chat.type
+            if chat_type in ('group', 'supergroup'):
+                try:
+                    me = await context.bot.get_me()
+                    member = await context.bot.get_chat_member(chat_id, me.id)
+                    # Determine admin status (works across PTB versions)
+                    status = getattr(member, 'status', None)
+                    is_admin = False
+                    if status in ('administrator', 'creator'):
+                        is_admin = True
+                    else:
+                        # Fallback by class name
+                        cls_name = type(member).__name__
+                        if cls_name in ('ChatMemberAdministrator', 'ChatMemberOwner', 'ChatMemberCreator'):
+                            is_admin = True
+                    if not is_admin:
+                        await update.message.reply_text(
+                            "Мне нужны права администратора в этом чате, чтобы создавать опросы и закреплять сообщения.\n"
+                            "Пожалуйста, добавьте бота в администраторы с правом: ‘Закреплять сообщения’."
+                        )
+                        return
+                    # Optional: check pin permission if present
+                    can_pin = getattr(member, 'can_pin_messages', True)
+                    if not can_pin:
+                        await update.message.reply_text(
+                            "У меня нет права ‘Закреплять сообщения’.\n"
+                            "Пожалуйста, дайте боту право закреплять сообщения или сделайте его администратором с этим правом."
+                        )
+                        return
+                except Exception as e:
+                    # If we cannot verify (e.g., limited API in tests), proceed but log
+                    logger.warning(f"Could not verify admin rights: {e}")
+        except Exception:
+            pass
 
         # Check if someone else is already creating a poll in this chat
         if chat_id in self.sessions:
@@ -841,7 +881,9 @@ class SimplePollBot:
             if cant_make_it_users and effective_member_count > 0:
                 logger.info(f"Processing users who can't make it: {cant_make_it_users}")
                 await self.handle_cant_make_it_users(poll_id, cant_make_it_users, context)
-                return True  # Poll completed
+                # Proceed to resolve the poll excluding 'Не могу' voters
+                await self.resolve_poll_excluding_cant_make_it(poll_id, context)
+                return True  # Poll completed by resolution
 
             try:
                 # Get current time and date
@@ -898,6 +940,13 @@ class SimplePollBot:
                         logger.info(f"Closed poll {poll_id} in chat {chat_id}")
                     except Exception as e:
                         logger.warning(f"Could not close poll {poll_id}: {e}")
+                    # Cancel any pending voting-timeout reminders in DB for this chat
+                    try:
+                        from task_storage import cancel_chat_tasks
+                        cancelled = cancel_chat_tasks(chat_id, task_type="poll_voting_timeout")
+                        logger.info(f"Cancelled {cancelled} 'poll_voting_timeout' tasks for chat {chat_id}")
+                    except Exception as e:
+                        logger.warning(f"Could not cancel voting timeout tasks for chat {chat_id}: {e}")
 
                     # Pin the confirmation message
                     try:
@@ -1595,10 +1644,51 @@ class SimplePollBot:
         except Exception as e:
             logger.error(f"Error sending follow-up message: {e}")
 
-    async def send_confirmation_message(self, chat_id, poll_result, context, poll_voters=None):
+    async def send_confirmation_message(self, chat_id, poll_result, context, poll_voters=None, poll_id=None):
         """Send immediate confirmation message with inline keyboard buttons"""
         try:
-            confirmation_text = f"План в силе? 💪 {poll_result}"
+            # Determine prefix (Сегодня/Завтра) based on meeting date in Polish timezone
+            prefix = ""
+            try:
+                from scheduled_tasks import parse_meeting_datetime_from_poll_result
+                meeting_dt = parse_meeting_datetime_from_poll_result(poll_result)
+                if meeting_dt is not None:
+                    try:
+                        from zoneinfo import ZoneInfo
+                        polish_tz = ZoneInfo("Europe/Warsaw")
+                    except ImportError:
+                        import pytz
+                        polish_tz = pytz.timezone("Europe/Warsaw")
+                    now_pl = datetime.now(polish_tz)
+                    meeting_date = meeting_dt.date()
+                    today_date = now_pl.date()
+                    if meeting_date == today_date:
+                        prefix = "Сегодня "
+                    elif meeting_date == (today_date + timedelta(days=1)):
+                        prefix = "Завтра "
+            except Exception as _:
+                # If anything fails, fall back to no prefix
+                pass
+
+            # Extract clean meeting label from poll_result to avoid any debug suffixes
+            meeting_label = poll_result
+            try:
+                import re
+                m = re.search(r"[А-ЯA-ZЁ][а-яa-zё]+\s*\(\d{2}\.\d{2}\)(?:\s+в\s+\d{1,2}:\d{2})?", poll_result)
+                if m:
+                    meeting_label = m.group(0)
+            except Exception:
+                meeting_label = poll_result
+
+            # Format meeting text: omit time if it's today, keep time if it's tomorrow
+            meeting_text = meeting_label
+            if prefix.strip() == "Сегодня":
+                try:
+                    import re
+                    meeting_text = re.sub(r"\s+в\s+\d{1,2}:\d{2}$", "", meeting_label)
+                except Exception:
+                    meeting_text = meeting_label
+            confirmation_text = f"{prefix}План в силе? 💪 {meeting_text}" 
 
             # Playful slow-processing notice (processing might take a moment)
             await context.bot.send_message(chat_id=chat_id, text="🤖 Бот иногда задумывается. Если кнопка не сработала сразу — дайте ему минутку-другую 😊")
@@ -1632,7 +1722,8 @@ class SimplePollBot:
                 'context': context,
                 'confirmed_users': set(),
                 'declined_users': set(),
-                'all_voters': poll_voters or set()
+                'all_voters': poll_voters or set(),
+                'poll_id': poll_id,
             }
 
             # Persist immediate confirmation
@@ -1834,32 +1925,46 @@ class SimplePollBot:
             poll_data = self.active_polls[poll_id]
             chat_id = poll_data['chat_id']
 
-            # Send notification for each user who can't make it
+            if not cant_make_it_users:
+                return
+
+            # Collect all user mentions
+            user_mentions = []
+            has_markdown_users = False
+
             for user_id in cant_make_it_users:
-                # Get user info to format username
                 try:
                     user_info = await context.bot.get_chat_member(chat_id, user_id)
                     user = user_info.user
                     if user.username:
-                        user_mention = f"@{user.username}"
+                        user_mentions.append(f"@{user.username}")
                     else:
                         # Fallback to first name if no username
-                        user_mention = f"[{user.first_name}](tg://user?id={user_id})"
-                        parse_mode = 'Markdown'
+                        user_mentions.append(f"[{user.first_name}](tg://user?id={user_id})")
+                        has_markdown_users = True
                 except:
                     # Fallback to user ID if can't get user info
-                    user_mention = f"[{user_id}](tg://user?id={user_id})"
-                    parse_mode = 'Markdown'
+                    user_mentions.append(f"[User {user_id}](tg://user?id={user_id})")
+                    has_markdown_users = True
 
-                # Send notification about user not being able to attend
-                cant_make_it_message = f"{user_mention} не сможет присоединиться к встрече"
-                if user_mention.startswith('@'):
-                    await context.bot.send_message(chat_id=chat_id, text=cant_make_it_message)
-                else:
-                    await context.bot.send_message(chat_id=chat_id, text=cant_make_it_message, parse_mode='Markdown')
+            # Create a single message with all users
+            if len(user_mentions) == 1:
+                message = f"{user_mentions[0]} не сможет присоединиться к встрече 😔"
+            else:
+                # Join users with commas and "и" for the last one
+                users_text = ", ".join(user_mentions[:-1]) + f" и {user_mentions[-1]}"
+                message = f"{users_text} не смогут присоединиться к встрече 😔"
 
-            # Removed: thumbs up reactions - using inline keyboard buttons instead
-            # The poll will be resolved based on votes only
+            # Add playful ending with cancel command
+            message += "\n\n🤖 🎪 Надумаете отменить - всегда есть команда /cancel_bot!"
+
+            # Send single message with appropriate parse mode
+            parse_mode = 'Markdown' if has_markdown_users else None
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode=parse_mode
+            )
 
         except Exception as e:
             logger.error(f"Error handling can't make it users: {e}")
@@ -1964,6 +2069,58 @@ class SimplePollBot:
             if not immediate_conf_data:
                 await query.answer("❌ Подтверждение не найдено.", show_alert=True)
                 return
+
+            # If we don't have voter data (e.g., older scheduled messages), try to reconstruct it from DB
+            try:
+                if not immediate_conf_data.get('all_voters'):
+                    from poll_storage import get_poll, get_votes
+                    poll = None
+                    pid = immediate_conf_data.get('poll_id')
+                    if pid:
+                        poll = get_poll(pid)
+                    if poll:
+                        options = poll.get('options', [])
+                        # Find selected option index by matching poll_result text
+                        selected_idx = None
+                        try:
+                            normalized_result = (immediate_conf_data.get('poll_result') or '').strip()
+                            for i, opt in enumerate(options):
+                                if (opt or '').strip() == normalized_result:
+                                    selected_idx = i
+                                    break
+                        except Exception:
+                            selected_idx = None
+                        votes_by_user = get_votes(poll.get('poll_id')) if poll.get('poll_id') else {}
+                        reconstructed = set()
+                        if selected_idx is not None:
+                            for uid_str, option_ids in (votes_by_user or {}).items():
+                                try:
+                                    if selected_idx in option_ids:
+                                        reconstructed.add(int(uid_str))
+                                except Exception:
+                                    continue
+                        else:
+                            # Fallback: include all voters who voted for any option except 'Не могу 😔'
+                            cant_idx = None
+                            for i, opt in enumerate(options):
+                                if opt == 'Не могу 😔':
+                                    cant_idx = i
+                                    break
+                            for uid_str, option_ids in (votes_by_user or {}).items():
+                                try:
+                                    if any((idx != cant_idx) for idx in option_ids):
+                                        reconstructed.add(int(uid_str))
+                                except Exception:
+                                    continue
+                        # Exclude the bot account id if present
+                        try:
+                            me = await context.bot.get_me()
+                            reconstructed.discard(me.id)
+                        except Exception:
+                            pass
+                        immediate_conf_data['all_voters'] = reconstructed
+            except Exception as e:
+                logger.warning(f"Could not reconstruct voter data for immediate confirmation: {e}")
 
             # Check if user already voted
             if user_id in immediate_conf_data['confirmed_users'] or user_id in immediate_conf_data['declined_users']:
@@ -2536,6 +2693,13 @@ class SimplePollBot:
                 logger.info(f"Closed poll {poll_id} after meeting confirmation")
             except Exception as e:
                 logger.warning(f"Could not close poll {poll_id}: {e}")
+            # Cancel any pending voting-timeout reminders in DB for this chat
+            try:
+                from task_storage import cancel_chat_tasks
+                cancelled = cancel_chat_tasks(chat_id, task_type="poll_voting_timeout")
+                logger.info(f"Cancelled {cancelled} 'poll_voting_timeout' tasks for chat {chat_id}")
+            except Exception as e:
+                logger.warning(f"Could not cancel voting timeout tasks for chat {chat_id}: {e}")
 
             # Clean up poll data
             self.cleanup_poll_data(poll_id)
@@ -2565,6 +2729,13 @@ class SimplePollBot:
                 logger.info(f"Closed poll {poll_id} - no common option")
             except Exception as e:
                 logger.warning(f"Could not close poll {poll_id}: {e}")
+            # Cancel any pending voting-timeout reminders in DB for this chat
+            try:
+                from task_storage import cancel_chat_tasks
+                cancelled = cancel_chat_tasks(chat_id, task_type="poll_voting_timeout")
+                logger.info(f"Cancelled {cancelled} 'poll_voting_timeout' tasks for chat {chat_id}")
+            except Exception as e:
+                logger.warning(f"Could not cancel voting timeout tasks for chat {chat_id}: {e}")
 
             # Suggest creating new poll
             suggest_message = "Попробуйте создать новый опрос с другими вариантами времени.\n\nИспользуйте /create_poll"
@@ -2601,14 +2772,13 @@ class SimplePollBot:
             except Exception as e:
                 logger.warning(f"Could not close poll {poll_id}: {e}")
 
-            # Unschedule voting timeout tasks only if explicitly requested
-            if cancel_voting_timeout:
-                try:
-                    from task_storage import cancel_chat_tasks
-                    cancelled = cancel_chat_tasks(chat_id, task_type="poll_voting_timeout")
-                    logger.info(f"Cancelled {cancelled} 'poll_voting_timeout' tasks for chat {chat_id}")
-                except Exception as e:
-                    logger.warning(f"Could not cancel voting timeout tasks for chat {chat_id}: {e}")
+            # Always unschedule voting timeout tasks when poll is closed
+            try:
+                from task_storage import cancel_chat_tasks
+                cancelled = cancel_chat_tasks(chat_id, task_type="poll_voting_timeout")
+                logger.info(f"Cancelled {cancelled} 'poll_voting_timeout' tasks for chat {chat_id}")
+            except Exception as e:
+                logger.warning(f"Could not cancel voting timeout tasks for chat {chat_id}: {e}")
 
             # Clean up poll data
             self.cleanup_poll_data(poll_id)
