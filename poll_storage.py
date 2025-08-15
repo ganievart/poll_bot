@@ -54,6 +54,14 @@ def upsert_poll(poll_id: str, chat_id: int, question: str, options: List[str], c
     conn = get_db_connection()
     cur = conn.cursor()
     try:
+        # Coerce None values to column defaults to avoid NOT NULL constraint errors
+        rn = bool(revote_notified) if revote_notified is not None else False
+        ir = bool(in_revote) if in_revote is not None else False
+        lts = last_tie_signature  # nullable
+        ltm = last_tie_message_at  # nullable
+        tmc = int(tie_message_count) if tie_message_count is not None else 0
+        rmid = revote_message_id  # nullable
+
         cur.execute(
             """
             INSERT INTO polls (
@@ -81,7 +89,7 @@ def upsert_poll(poll_id: str, chat_id: int, question: str, options: List[str], c
             """,
             (poll_id, chat_id, question, json.dumps(options, ensure_ascii=False), creator_id,
              poll_message_id, target_member_count, pinned_message_id, is_closed,
-             revote_notified, in_revote, last_tie_signature, last_tie_message_at, tie_message_count, revote_message_id)
+             rn, ir, lts, ltm, tmc, rmid)
         )
     finally:
         cur.close(); conn.close()
