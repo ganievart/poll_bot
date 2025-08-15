@@ -143,18 +143,24 @@ class ScheduledTaskManager:
             logger.info(f"Meeting at: {meeting_datetime.strftime('%d.%m.%Y %H:%M %Z')} (Polish time)")
             logger.info(f"Follow-up scheduled for: {followup_datetime.strftime('%d.%m.%Y %H:%M %Z')} (72 hours after meeting)")
             
-            # Convert to naive datetime for MySQL storage
-            followup_datetime_naive = followup_datetime.replace(tzinfo=None)
+            # Convert to UTC naive datetime for MySQL storage
+            try:
+                import pytz
+                utc_tz = pytz.UTC
+            except ImportError:
+                from zoneinfo import ZoneInfo
+                utc_tz = ZoneInfo("UTC")
+            followup_datetime_utc_naive = followup_datetime.astimezone(utc_tz).replace(tzinfo=None)
             
             task_id = add_scheduled_task(
                 chat_id=chat_id,
                 poll_id=None,  # No specific poll for follow-up
                 task_type="followup",
-                scheduled_time=followup_datetime_naive,
+                scheduled_time=followup_datetime_utc_naive,
                 task_data=poll_result
             )
             
-            logger.info(f"Stored follow-up task {task_id} in database for {followup_datetime_naive}")
+            logger.info(f"Stored follow-up task {task_id} in database (UTC): {followup_datetime_utc_naive}")
             return True
             
         except Exception as e:
@@ -242,9 +248,9 @@ class ScheduledTaskManager:
                 logger.error("Database scheduling not available - cannot schedule poll voting timeout")
                 return False
             
-            # Calculate when to send the reminder (1 hour from now)
-            from datetime import datetime, timedelta
-            reminder_time = datetime.now() + timedelta(hours=1)  # 1 hour timeout
+            # Calculate when to send the reminder (1 hour from now) in UTC
+            from datetime import datetime, timedelta, timezone
+            reminder_time = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1)
             
             task_id = add_scheduled_task(
                 chat_id=chat_id,
@@ -254,7 +260,7 @@ class ScheduledTaskManager:
                 task_data=str(missing_votes)
             )
             
-            logger.info(f"Stored poll voting timeout task {task_id} in database for {reminder_time}")
+            logger.info(f"Stored poll voting timeout task {task_id} in database (UTC): {reminder_time}")
             return True
             
         except Exception as e:
@@ -274,8 +280,9 @@ class ScheduledTaskManager:
                 logger.error("Database scheduling not available - cannot schedule session cleanup")
                 return False
             
-            # Schedule next cleanup in 1 hour
-            next_cleanup_time = datetime.now() + timedelta(hours=1)
+            # Schedule next cleanup in 1 hour (UTC)
+            from datetime import timezone
+            next_cleanup_time = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None)
             
             task_id = add_scheduled_task(
                 chat_id=0,  # Global task, not specific to a chat
@@ -285,7 +292,7 @@ class ScheduledTaskManager:
                 task_data=None
             )
             
-            logger.info(f"Stored session cleanup task {task_id} in database for {next_cleanup_time}")
+            logger.info(f"Stored session cleanup task {task_id} in database (UTC): {next_cleanup_time}")
             return True
             
         except Exception as e:

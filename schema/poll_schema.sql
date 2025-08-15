@@ -15,6 +15,12 @@ CREATE TABLE IF NOT EXISTS polls (
     INDEX idx_chat_id (chat_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+ALTER TABLE polls ADD COLUMN revote_notified BOOLEAN NOT NULL DEFAULT FALSE AFTER is_closed, ADD COLUMN in_revote
+BOOLEAN NOT NULL DEFAULT FALSE AFTER revote_notified, ADD COLUMN last_tie_signature TEXT NULL AFTER in_revote, ADD
+COLUMN last_tie_message_at DATETIME NULL AFTER last_tie_signature, ADD COLUMN tie_message_count INT NOT NULL DEFAULT
+0 AFTER last_tie_message_at, ADD COLUMN revote_message_id BIGINT NULL AFTER tie_message_count;
+
+
 -- Votes table stores per-user selections as array of option indices
 CREATE TABLE IF NOT EXISTS poll_votes (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,

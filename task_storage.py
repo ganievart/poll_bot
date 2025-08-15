@@ -244,6 +244,44 @@ def cancel_chat_tasks(chat_id: int, task_type: Optional[str] = None) -> int:
             connection.close()
 
 
+def cancel_poll_tasks(chat_id: int, poll_id: str, task_type: Optional[str] = None) -> int:
+    """
+    Cancel all pending tasks for a specific chat AND poll. If task_type provided, filter by it.
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        if task_type:
+            query = (
+                "UPDATE scheduled_tasks SET is_executed = TRUE, executed_at = NOW() "
+                "WHERE chat_id = %s AND poll_id = %s AND task_type = %s AND is_executed = FALSE"
+            )
+            params = (chat_id, poll_id, task_type)
+        else:
+            query = (
+                "UPDATE scheduled_tasks SET is_executed = TRUE, executed_at = NOW() "
+                "WHERE chat_id = %s AND poll_id = %s AND is_executed = FALSE"
+            )
+            params = (chat_id, poll_id)
+        cursor.execute(query, params)
+        cancelled_count = cursor.rowcount
+        if task_type:
+            logger.info(f"Cancelled {cancelled_count} tasks of type '{task_type}' for chat {chat_id}, poll {poll_id}")
+        else:
+            logger.info(f"Cancelled {cancelled_count} tasks for chat {chat_id}, poll {poll_id}")
+        return cancelled_count
+    except Error as e:
+        logger.error(f"Error cancelling tasks for chat {chat_id}, poll {poll_id}: {e}")
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
 def get_chat_pending_tasks(chat_id: int) -> List[Dict[str, Any]]:
     """
     Get all pending tasks for a specific chat

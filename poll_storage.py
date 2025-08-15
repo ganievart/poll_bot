@@ -44,14 +44,24 @@ def get_db_connection():
 def upsert_poll(poll_id: str, chat_id: int, question: str, options: List[str], creator_id: int,
                 poll_message_id: Optional[int] = None, target_member_count: Optional[int] = None,
                 pinned_message_id: Optional[int] = None,
-                is_closed: bool = False) -> None:
+                is_closed: bool = False,
+                revote_notified: Optional[bool] = None,
+                in_revote: Optional[bool] = None,
+                last_tie_signature: Optional[str] = None,
+                last_tie_message_at: Optional[datetime] = None,
+                tie_message_count: Optional[int] = None,
+                revote_message_id: Optional[int] = None) -> None:
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute(
             """
-            INSERT INTO polls (poll_id, chat_id, question, options_json, creator_id, poll_message_id, target_member_count, pinned_message_id, is_closed)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO polls (
+              poll_id, chat_id, question, options_json, creator_id,
+              poll_message_id, target_member_count, pinned_message_id, is_closed,
+              revote_notified, in_revote, last_tie_signature, last_tie_message_at, tie_message_count, revote_message_id
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             AS new
             ON DUPLICATE KEY UPDATE
               chat_id = new.chat_id,
@@ -61,10 +71,17 @@ def upsert_poll(poll_id: str, chat_id: int, question: str, options: List[str], c
               poll_message_id = new.poll_message_id,
               target_member_count = new.target_member_count,
               pinned_message_id = new.pinned_message_id,
-              is_closed = new.is_closed
+              is_closed = new.is_closed,
+              revote_notified = COALESCE(new.revote_notified, polls.revote_notified),
+              in_revote = COALESCE(new.in_revote, polls.in_revote),
+              last_tie_signature = COALESCE(new.last_tie_signature, polls.last_tie_signature),
+              last_tie_message_at = COALESCE(new.last_tie_message_at, polls.last_tie_message_at),
+              tie_message_count = COALESCE(new.tie_message_count, polls.tie_message_count),
+              revote_message_id = COALESCE(new.revote_message_id, polls.revote_message_id)
             """,
             (poll_id, chat_id, question, json.dumps(options, ensure_ascii=False), creator_id,
-             poll_message_id, target_member_count, pinned_message_id, is_closed)
+             poll_message_id, target_member_count, pinned_message_id, is_closed,
+             revote_notified, in_revote, last_tie_signature, last_tie_message_at, tie_message_count, revote_message_id)
         )
     finally:
         cur.close(); conn.close()
@@ -108,7 +125,58 @@ def get_open_polls() -> List[Dict[str, Any]]:
         cur.close(); conn.close()
 
 
+def get_expired_open_polls(days: int = 2) -> List[Dict[str, Any]]:
+    """Return polls still open whose created_at is older than NOW() - INTERVAL days."""
+    conn = get_db_connection()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            "SELECT poll_id, chat_id, poll_message_id, question, created_at FROM polls WHERE is_closed = FALSE AND created_at < DATE_SUB(NOW(), INTERVAL %s DAY)",
+            (days,)
+        )
+        rows = cur.fetchall() or []
+        return rows
+    finally:
+        cur.close(); conn.close()
+
+
 # Votes
+
+def update_tie_state(poll_id: str,
+                     revote_notified: Optional[bool] = None,
+                     in_revote: Optional[bool] = None,
+                     last_tie_signature: Optional[str] = None,
+                     last_tie_message_at: Optional[datetime] = None,
+                     tie_message_count: Optional[int] = None,
+                     revote_message_id: Optional[int] = None) -> None:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Build dynamic SET clause only for provided fields
+        fields = []
+        params = []
+        if revote_notified is not None:
+            fields.append("revote_notified=%s"); params.append(revote_notified)
+        if in_revote is not None:
+            fields.append("in_revote=%s"); params.append(in_revote)
+        if last_tie_signature is not None:
+            fields.append("last_tie_signature=%s"); params.append(last_tie_signature)
+        if last_tie_message_at is not None:
+            fields.append("last_tie_message_at=%s"); params.append(last_tie_message_at)
+        if tie_message_count is not None:
+            fields.append("tie_message_count=%s"); params.append(tie_message_count)
+        if revote_message_id is not None:
+            fields.append("revote_message_id=%s"); params.append(revote_message_id)
+        if not fields:
+            return
+        set_clause = ", ".join(fields)
+        query = f"UPDATE polls SET {set_clause} WHERE poll_id=%s"
+        params.append(poll_id)
+        cur.execute(query, tuple(params))
+    finally:
+        cur.close(); conn.close()
+
+
 
 
 def upsert_vote(poll_id: str, user_id: int, option_ids: List[int]) -> None:

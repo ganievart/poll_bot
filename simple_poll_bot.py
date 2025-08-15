@@ -236,86 +236,61 @@ class SimplePollBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         text = (
-            "👋 Привет! Я бот для планирования встреч и создания опросов.\n\n"
-            "🗳️ Команды:\n"
-            "/create_poll - Создать новый опрос для встречи\n"
-            "/cancel_bot - Отменить все задачи и открепить сообщения\n\n"
-            "✨ Что я умею:\n"
-            "• 📅 Создание опросов с датами и временем\n"
-            "• 🎯 Автоматическое определение лучшего варианта\n"
-            "• ⏰ Умные напоминания и подтверждения\n"
-            "• 📌 Закрепление важных сообщений\n"
-            "• 💪 Подтверждение участия перед встречей\n"
-            "• 🎉 Отслеживание готовности всех участников\n\n"
-            "🔄 Как это работает:\n"
-            "1️⃣ Выбираешь вопрос (по умолчанию 'Собираемся?')\n"
-            "2️⃣ Выбираешь дни из ближайших 7 дней\n"
-            "3️⃣ Выбираешь удобное время\n"
-            "4️⃣ Создается опрос для голосования\n"
-            "5️⃣ Автоматически определяется результат и закрепляется\n"
-            "6️⃣ Отправляется подтверждение участия за 24ч/4ч до встречи\n"
-            "7️⃣ Сообщение открепляется через 10 часов после встречи\n"
-            "8️⃣ Спрашиваю 'Как прошла встреча?' через 3 дня\n\n"
-            "🚀 Начни планировать встречу с /create_poll!"
+            "👋 Привет! Я бот, который помогает планировать встречи через удобные опросы.\n\n"
+            "Я быстро собираю варианты даты и времени, выбираю лучший по голосам и отправляю нужные напоминания.\n\n"
+            "• Посмотри /help — список доступных команд\n"
+            "• Открой /info — подробности о возможностях и сценариях использования\n\n"
+            "🚀 Готов? Начинай с /create_poll"
         )
         await update.message.reply_text(text)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command - show command usage and scheduling rules"""
+        """Handle /help command - list all available commands"""
         help_text = (
-            "📚 **Справка по командам**\n\n"
-            "🗳️ **Команды:**\n"
-            "`/start` - Приветственное сообщение с возможностями бота\n"
-            "`/help` - Показать справку по командам и правилам планирования\n"
-            "`/info` - Краткое руководство по использованию бота\n"
-            "`/create_poll` - Начать создание нового опроса\n"
-            "`/cancel_bot` - Отменить все запланированные события и открепить сообщения\n"
-            "`/die` - Секретная команда... Попробуйте на свой страх и риск 💀\n\n"
-            "⏰ **Правила планирования:**\n"
-            "• **Время голосования:** 1 час на голосование\n"
-            "• **Мгновенное подтверждение:** через 1 минуту после закрытия опроса\n"
-            "• **Подтверждение перед встречей:**\n"
-            "  - Если встреча >24ч → за 24 часа до встречи\n"
-            '  - Если встреча 4-24ч → за 4 часа до встречи\n'
-            '  - Если встреча <4ч → подтверждение не отправляется\n'
-            "• **Открепление сообщений:** через 10 часов после встречи\n"
-            "• **Вопрос о встрече:** через 72 часа после встречи\n\n"
-            "🌍 **Часовой пояс:** Все время в польском часовом поясе (Europe/Warsaw)\n\n"
-            "💡 **Советы:**\n"
-            "• Только один опрос на чат одновременно\n"
-            "• Бот отслеживает голосующих и отправляет умные напоминания\n"
-            "• Автоматическое определение результата и подтверждение встречи\n"
-            "• Используйте `/cancel_bot` чтобы остановить все запланированные действия"
+            "📚 Справка по командам\n\n"
+            "🗳️ Доступные команды:\n"
+            "• /start — краткое знакомство и ссылки на /help и /info\n"
+            "• /help — список команд и краткие пояснения\n"
+            "• /info — подробная информация о возможностях\n"
+            "• /create_poll — создать новый опрос для планирования встречи\n"
+            "• /cancel_bot — отменить все запланированные задачи и открепить сообщения\n"
+            "• /subscribe — подписаться на уведомления\n"
+            "• /unsubscribe — отписаться от уведомлений\n"
+            "• /subscribers — показать количество подписчиков\n"
+            "• /die — секретная команда (для развлечения) 💀\n"
         )
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        await update.message.reply_text(help_text)
 
     async def info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /info command - summary of how to use the bot"""
+        """Handle /info command - detailed capabilities and behavior"""
         info_text = (
-            "ℹ️ **Как пользоваться ботом**\n\n"
-            "🎯 **Цель:** Планирование встреч через опросы\n\n"
-            "📋 **Пошаговая инструкция:**\n"
-            "1️⃣ Напишите `/create_poll`\n"
-            "2️⃣ Выберите или введите вопрос (по умолчанию 'Собираемся?')\n"
-            "3️⃣ Выберите дни из ближайших 7 дней\n"
-            "4️⃣ Выберите подходящее время\n"
-            "5️⃣ Бот создаст опрос для голосования\n\n"
-            "🤖 **Что происходит автоматически:**\n"
-            "• Через час бот пингует непроголосовавших\n"
-            "• После голосования всех - определяется результат\n"
-            "• Результат закрепляется в чате\n"
-            "• Через минуту - запрос подтверждения участия\n"
-            "• Перед встречей - финальное подтверждение\n"
-            "• После встречи - сообщение открепляется\n"
-            "• Через 3 дня - вопрос о том, как прошла встреча\n\n"
-            "⚡ **Особенности:**\n"
-            "• Умное определение лучшего варианта времени\n"
-            "• Отслеживание готовности всех участников\n"
-            "• Поддержка польского часового пояса\n"
-            "• Защита от дублирования голосов\n\n"
-            "❓ Нужна помощь? Используйте `/help` для подробной справки!"
+            "ℹ️ Подробно о возможностях бота\n\n"
+            "🎯 Для чего нужен: планирование встреч через опросы с датами и временем.\n\n"
+            "📋 Как это работает:\n"
+            "1️⃣ /create_poll — выбираешь вопрос (или свой), дни и время\n"
+            "2️⃣ Бот создаёт опрос для голосования\n"
+            "3️⃣ Когда все проголосуют — бот определяет результат\n"
+            "4️⃣ Если выбран вариант встречи — отправляется сообщение подтверждения и закрепляется\n"
+            "5️⃣ Бот автоматически планирует напоминания и последующие сообщения\n\n"
+            "🤖 Автоматически бот делает:\n"
+            "• Напоминание тем, кто не проголосовал (через 1 час)\n"
+            "• Подтверждение встречи: за 24ч (или за 4ч, если осталось меньше суток)\n"
+            "• Открепление закреплённого сообщения: через 10 часов после встречи\n"
+            "• Вопрос о впечатлениях: через 72 часа после встречи\n\n"
+            "🧠 Логика выбора:\n"
+            "• Если все выбрали один и тот же вариант — он и побеждает\n"
+            "• Если у всех несколько одинаковых вариантов — берём самый ранний\n"
+            "• Если получилась ничья — бот один раз попросит переголосовать\n"
+            "• Если все выбрали ‘Не могу 😔’ — встреча отменяется и бот предложит создать новый опрос\n\n"
+            "🌍 Часовой пояс:\n"
+            "• Время интерпретируется как Europe/Warsaw и конвертируется в UTC для планирования.\n"
+            "• Это помогает корректно учитывать переходы на летнее/зимнее время.\n\n"
+            "💡 Советы:\n"
+            "• Один активный опрос на чат\n"
+            "• Используй /cancel_bot, чтобы отменить все запланированные действия\n"
+            "• Команда /help — список команд"
         )
-        await update.message.reply_text(info_text, parse_mode='Markdown')
+        await update.message.reply_text(info_text)
 
     async def die_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /die command — now with fun fantasy responses only"""
@@ -894,6 +869,16 @@ class SimplePollBot:
                 # Get poll results to find the most voted option
                 most_voted_result = await self.get_most_voted_option_fallback_with_new_logic(poll_id, context)
 
+                # Early guard: if the chosen meeting time is already in the past, cancel and inform
+                try:
+                    parsed_result = most_voted_result if isinstance(most_voted_result, str) else None
+                    if parsed_result:
+                        handled = await self.meeting_in_past_guard(poll_id, chat_id, context, parsed_result)
+                        if handled:
+                            return True
+                except Exception as e:
+                    logger.warning(f"Past-meeting guard error during resolution for poll {poll_id}: {e}")
+
                 # Send confirmation message with the most voted result
                 if most_voted_result:
                     # Check if everyone can't make it
@@ -1193,6 +1178,45 @@ class SimplePollBot:
 
             # Send revote notification with a fun, engaging message
             import random
+            # Build a normalized tie signature to persist across restarts
+            tie_signature = None
+            try:
+                tied = [opt for opt in (vote_analysis.get('tied_options') or []) if opt != "Не могу 😔"]
+                tie_signature = ",".join(sorted(tied)) if tied else ""
+            except Exception:
+                tie_signature = ""
+
+            # Load persisted tie state if available
+            try:
+                if get_poll:
+                    db_poll = get_poll(poll_id)
+                    if db_poll:
+                        poll_data['revote_notified'] = db_poll.get('revote_notified', poll_data.get('revote_notified', False))
+                        poll_data['in_revote'] = db_poll.get('in_revote', poll_data.get('in_revote', False))
+                        poll_data['last_tie_signature'] = db_poll.get('last_tie_signature', poll_data.get('last_tie_signature'))
+                        poll_data['last_tie_message_at'] = db_poll.get('last_tie_message_at', poll_data.get('last_tie_message_at'))
+                        poll_data['tie_message_count'] = db_poll.get('tie_message_count', poll_data.get('tie_message_count', 0))
+                        poll_data['revote_message_id'] = db_poll.get('revote_message_id', poll_data.get('revote_message_id'))
+            except Exception as e:
+                logger.warning(f"Could not load tie-state from DB for {poll_id}: {e}")
+
+            # Anti-spam guard: send tie message only once per poll
+            if poll_data.get('revote_notified'):
+                logger.info(f"Tie message already sent once for poll {poll_id}; skipping re-send")
+                # Ensure DB flags are set in case of in-memory-only state
+                try:
+                    if upsert_poll:
+                        from poll_storage import update_tie_state
+                        update_tie_state(
+                            poll_id,
+                            revote_notified=True,
+                            in_revote=True,
+                            last_tie_signature=tie_signature
+                        )
+                except Exception as e:
+                    logger.warning(f"Could not persist minimal tie-state for {poll_id}: {e}")
+                return "REVOTE_PROMPTED"
+
             tie_messages = [
                 "Ой, ничья! 🤯 Похоже, наш бот в замешательстве... Помогите ему выбрать — измените голос, если сможете!\n\nПожалуйста, измените свой голос в опросе выше.",
                 "Мы застряли в голосовательной пробке 🚦 Кто-нибудь, поменяйте выбор и спасите встречу!\n\nПожалуйста, измените свой голос в опросе выше.",
@@ -1202,11 +1226,38 @@ class SimplePollBot:
             ]
             revote_message = random.choice(tie_messages)
 
-            await context.bot.send_message(chat_id=chat_id, text=revote_message)
+            sent_msg = await context.bot.send_message(chat_id=chat_id, text=revote_message)
 
             # Mark poll as in revote state (don't close it, keep it active)
             poll_data['in_revote'] = True
             poll_data['revote_notified'] = True
+            poll_data['last_tie_signature'] = tie_signature
+            poll_data['tie_message_count'] = int(poll_data.get('tie_message_count', 0) or 0) + 1
+            poll_data['revote_message_id'] = getattr(sent_msg, 'message_id', None)
+            poll_data['last_tie_message_at'] = time.time()
+
+            # Persist tie-state to DB
+            try:
+                if upsert_poll:
+                    # Convert last_tie_message_at to datetime for DB if needed
+                    last_dt = None
+                    try:
+                        from datetime import datetime
+                        last_dt = datetime.utcfromtimestamp(poll_data['last_tie_message_at']) if isinstance(poll_data['last_tie_message_at'], (int, float)) else poll_data['last_tie_message_at']
+                    except Exception:
+                        last_dt = None
+                    from poll_storage import update_tie_state
+                    update_tie_state(
+                        poll_id,
+                        revote_notified=poll_data['revote_notified'],
+                        in_revote=poll_data['in_revote'],
+                        last_tie_signature=poll_data['last_tie_signature'],
+                        last_tie_message_at=last_dt,
+                        tie_message_count=poll_data['tie_message_count'],
+                        revote_message_id=poll_data['revote_message_id']
+                    )
+            except Exception as e:
+                logger.warning(f"Could not persist tie-state for {poll_id}: {e}")
 
             logger.info(f"Poll {poll_id} marked for revote - users prompted to change votes")
 
@@ -1243,6 +1294,65 @@ class SimplePollBot:
         except Exception as e:
             logger.error(f"Error in fallback method with new logic: {e}")
             return None
+
+    async def meeting_in_past_guard(self, poll_id, chat_id, context, meeting_option_text) -> bool:
+        """If meeting time (Warsaw) is in the past, cancel all tasks for this poll, send playful message, close and clean up.
+        Returns True if handled (i.e., meeting is in the past and we performed cleanup), else False.
+        """
+        try:
+            # Parse meeting datetime from option text using shared parser
+            from scheduled_tasks import parse_meeting_datetime_from_poll_result
+            meeting_dt = parse_meeting_datetime_from_poll_result(meeting_option_text)
+            if meeting_dt is None:
+                return False
+            # Compare against current time in Polish timezone
+            try:
+                from zoneinfo import ZoneInfo
+                polish_tz = ZoneInfo("Europe/Warsaw")
+            except ImportError:
+                import pytz
+                polish_tz = pytz.timezone("Europe/Warsaw")
+            now_pl = datetime.now(polish_tz)
+            if meeting_dt <= now_pl:
+                # Cancel all scheduled tasks for this chat+poll
+                try:
+                    from task_storage import cancel_poll_tasks
+                    cancel_poll_tasks(chat_id, poll_id)
+                except Exception as e:
+                    logger.warning(f"Could not cancel tasks for past meeting (chat {chat_id}, poll {poll_id}): {e}")
+                # Inform users
+                playful = (
+                    "🙈 Время встречи уже прошло — не могу её запланировать.\n"
+                    "Создайте новый опрос с /create_poll"
+                )
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=playful)
+                except Exception as e:
+                    logger.warning(f"Could not send past-meeting playful message in chat {chat_id}: {e}")
+                # Try to stop the poll and mark it closed
+                try:
+                    if poll_id in self.active_polls:
+                        poll_message_id = self.active_polls[poll_id].get('poll_message_id')
+                        if poll_message_id:
+                            try:
+                                await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+                            except Exception as e:
+                                logger.warning(f"Could not stop poll {poll_id} in chat {chat_id}: {e}")
+                        try:
+                            if set_poll_closed:
+                                set_poll_closed(poll_id, True)
+                        except Exception as e:
+                            logger.warning(f"DB set_poll_closed failed for past meeting poll {poll_id}: {e}")
+                        # Cleanup local state
+                        self.cleanup_poll_data(poll_id)
+                        del self.active_polls[poll_id]
+                except Exception as e:
+                    logger.warning(f"Cleanup after past meeting failed for poll {poll_id}: {e}")
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"meeting_in_past_guard error: {e}")
+            return False
 
     async def schedule_confirmation_message(self, poll_id, chat_id, context, poll_result, poll_voters=None):
         """Schedule 'В силе?' confirmation question - 24h before if >24h away, 4 hours before if 4-24h away"""
@@ -1286,6 +1396,23 @@ class SimplePollBot:
 
             logger.info(f"Meeting datetime: {meeting_datetime.strftime('%d.%m.%Y %H:%M %Z')} (Polish time)")
             logger.info(f"Hours until meeting: {hours_until_meeting:.1f}")
+
+            # Past-time guard: if meeting already in the past, cancel all tasks and notify
+            if hours_until_meeting <= 0:
+                try:
+                    from task_storage import cancel_poll_tasks
+                    cancel_poll_tasks(chat_id, poll_id)
+                except Exception as e:
+                    logger.warning(f"Could not cancel tasks for past meeting (chat {chat_id}, poll {poll_id}): {e}")
+                playful = (
+                    "🙈 Время встречи уже прошло — не могу её запланировать.\n"
+                    "Создайте новый опрос с /create_poll"
+                )
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=playful)
+                except Exception as e:
+                    logger.warning(f"Could not send past-meeting playful message in chat {chat_id}: {e}")
+                return
 
             # Determine when to send confirmation
             if hours_until_meeting > 24:
@@ -2626,6 +2753,14 @@ class SimplePollBot:
             poll_data = self.active_polls[poll_id]
             chat_id = poll_data['chat_id']
 
+            # Early guard: if the chosen meeting time is already in the past, cancel and inform
+            try:
+                handled = await self.meeting_in_past_guard(poll_id, chat_id, context, option)
+                if handled:
+                    return
+            except Exception as e:
+                logger.warning(f"Past-meeting guard error in confirm_meeting_with_option for poll {poll_id}: {e}")
+
             # Send confirmation message
             confirmation_message = f"Собираемся в {option}"
             sent_message = await context.bot.send_message(
@@ -2807,6 +2942,14 @@ class SimplePollBot:
             chat_id = poll_data['chat_id']
 
             if should_pin:
+                # Early guard: if the chosen meeting time is already in the past, cancel and inform
+                try:
+                    handled = await self.meeting_in_past_guard(poll_id, chat_id, context, proposed_option)
+                    if handled:
+                        return
+                except Exception as e:
+                    logger.warning(f"Past-meeting guard error in handle_pin_proposal for poll {poll_id}: {e}")
+
                 # Pin the meeting confirmation and schedule reminders
                 confirmation_message = f"Собираемся в {proposed_option}"
 

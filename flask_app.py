@@ -539,24 +539,58 @@ def run_scheduled_tasks():
     try:
         # Import task storage module
         try:
-            from task_storage import get_due_tasks, mark_task_executed
+            from task_storage import get_due_tasks, mark_task_executed, cancel_chat_tasks
         except ImportError:
             logger.error("task_storage module not found")
             return jsonify({"error": "task_storage module not available"}), 500
         
+        # Import poll storage helpers
+        try:
+            from poll_storage import get_expired_open_polls, set_poll_closed
+        except ImportError:
+            logger.error("poll_storage module not found")
+            return jsonify({"error": "poll_storage module not available"}), 500
+        
         if not ensure_bot_setup():
             return jsonify({"error": "Bot not configured"}), 500
         
+        # First, sweep and close expired polls (open > 2 days)
+        expired = get_expired_open_polls(days=2)
+        closed_count = 0
+        for p in expired:
+            chat_id = p['chat_id']
+            poll_id = p['poll_id']
+            poll_msg_id = p.get('poll_message_id')
+            # Send playful message and try to stop poll
+            try:
+                playful = (
+                    "⏳ Этот опрос был открыт уже 2 дня — закрываю его.\n"
+                    "Если нужно, создайте новый с /create_poll"
+                )
+                loop = get_or_create_event_loop()
+                loop.run_until_complete(bot_application.bot.send_message(chat_id=chat_id, text=playful))
+                try:
+                    if poll_msg_id:
+                        loop.run_until_complete(bot_application.bot.stop_poll(chat_id=chat_id, message_id=poll_msg_id))
+                except Exception as e:
+                    logger.warning(f"Could not stop poll {poll_id} in chat {chat_id}: {e}")
+            except Exception as e:
+                logger.warning(f"Could not send playful close message for {poll_id} in chat {chat_id}: {e}")
+            # Mark DB closed regardless of telegram success to avoid repeats
+            try:
+                set_poll_closed(poll_id, True)
+            except Exception as e:
+                logger.warning(f"DB set_poll_closed failed for expired poll {poll_id}: {e}")
+            # Cancel pending voting-timeout tasks for this chat+poll
+            try:
+                from task_storage import cancel_poll_tasks
+                cancel_poll_tasks(chat_id, poll_id, task_type="poll_voting_timeout")
+            except Exception as e:
+                logger.warning(f"Could not cancel voting timeout tasks for chat {chat_id}, poll {poll_id}: {e}")
+            closed_count += 1
+        
         # Get tasks that are due for execution
         due_tasks = get_due_tasks()
-        
-        if not due_tasks:
-            logger.info("No due tasks found")
-            return jsonify({
-                "status": "success",
-                "message": "No due tasks to execute",
-                "tasks_executed": 0
-            })
         
         executed_count = 0
         errors = []
@@ -576,36 +610,26 @@ def run_scheduled_tasks():
                 loop = get_or_create_event_loop()
                 
                 if task_type == 'confirmation':
-                    # Send "План в силе?" confirmation message with buttons
                     loop.run_until_complete(
                         send_confirmation_task(chat_id, task_data, poll_id)
                     )
-                    
                 elif task_type == 'followup':
-                    # Send follow-up question about how the meeting went
                     loop.run_until_complete(
                         send_followup_task(chat_id, task_data)
                     )
-                    
                 elif task_type == 'unpin_message':
-                    # Unpin the meeting confirmation message
                     message_id = int(task_data) if task_data and task_data.isdigit() else None
                     loop.run_until_complete(
                         unpin_message_task(chat_id, message_id)
                     )
-                    
                 elif task_type == 'poll_voting_timeout':
-                    # Send reminder for non-voters (1 hour timeout)
                     loop.run_until_complete(
                         send_voting_reminder_task(chat_id, poll_id, task_data)
                     )
-                    
                 elif task_type == 'session_cleanup':
-                    # Clean up expired sessions
                     loop.run_until_complete(
                         cleanup_sessions_task()
                     )
-                    
                 else:
                     logger.warning(f"Unknown task type: {task_type}")
                     errors.append(f"Unknown task type: {task_type} for task {task_id}")
@@ -626,7 +650,8 @@ def run_scheduled_tasks():
         # Return execution summary
         result = {
             "status": "success",
-            "message": f"Executed {executed_count} of {len(due_tasks)} due tasks",
+            "message": f"Closed {closed_count} expired polls. Executed {executed_count} of {len(due_tasks)} due tasks",
+            "expired_polls_closed": closed_count,
             "tasks_executed": executed_count,
             "total_due_tasks": len(due_tasks)
         }
@@ -635,7 +660,7 @@ def run_scheduled_tasks():
             result["errors"] = errors
             result["status"] = "partial_success"
         
-        logger.info(f"Task execution completed: {executed_count}/{len(due_tasks)} successful")
+        logger.info(f"Run completed: closed {closed_count} expired polls; executed {executed_count}/{len(due_tasks)} tasks")
         return jsonify(result)
         
     except Exception as e:
