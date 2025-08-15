@@ -1691,7 +1691,7 @@ class SimplePollBot:
             confirmation_text = f"{prefix}План в силе? 💪 {meeting_text}" 
 
             # Playful slow-processing notice (processing might take a moment)
-            await context.bot.send_message(chat_id=chat_id, text="🤖 Бот иногда задумывается. Если кнопка не сработала сразу — дайте ему минутку-другую 😊")
+            # await context.bot.send_message(chat_id=chat_id, text="🤖 Бот иногда задумывается. Если кнопка не сработала сразу — дайте ему минутку-другую 😊")
 
             # Create inline keyboard for confirmation
             keyboard = [

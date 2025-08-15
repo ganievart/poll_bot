@@ -27,4 +27,3 @@ CREATE TABLE IF NOT EXISTS poll_votes (
     CONSTRAINT fk_votes_poll FOREIGN KEY (poll_id) REFERENCES polls(poll_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Immediate confirmations table removed
