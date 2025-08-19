@@ -109,6 +109,14 @@ try:
     except ImportError:
         upsert_poll = set_poll_closed = get_poll = upsert_vote = get_votes = None
         logger.warning("poll_storage not available; state will not persist across restarts")
+
+    # Meeting storage (optional)
+    try:
+        from meeting_storage import insert_or_update_meeting
+    except ImportError:
+        insert_or_update_meeting = None
+        logger.warning("meeting_storage not available; meetings will not be persisted")
+
     # Placeholders for removed immediate confirmation storage functions
     upsert_immediate_confirmation = None
     get_immediate_confirmation = None
@@ -257,6 +265,7 @@ class SimplePollBot:
             "• /subscribe — подписаться на уведомления\n"
             "• /unsubscribe — отписаться от уведомлений\n"
             "• /subscribers — показать количество подписчиков\n"
+            "• /days_since_meeting — сколько дней прошло с последней встречи\n"
             "• /die — секретная команда (для развлечения) 💀\n"
         )
         await update.message.reply_text(help_text)
@@ -291,6 +300,81 @@ class SimplePollBot:
             "• Команда /help — список команд"
         )
         await update.message.reply_text(info_text)
+
+    async def days_since_last_meeting(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Report how many days since the last meeting in this chat (playful)."""
+        try:
+            chat_id = update.effective_chat.id
+            try:
+                from meeting_storage import get_last_meeting_for_chat
+            except ImportError:
+                await update.message.reply_text("❌ База данных недоступна. Попробуйте позже.")
+                return
+
+            row = None
+            try:
+                row = get_last_meeting_for_chat(chat_id)
+            except Exception as e:
+                logger.warning(f"DB error fetching last meeting for chat {chat_id}: {e}")
+
+            if not row:
+                await update.message.reply_text("🤷‍♂️ Я не нашёл прошедших встреч для этого чата.")
+                return
+
+            # meeting_datetime is stored in UTC naive; convert to Europe/Warsaw and compare dates
+            try:
+                from zoneinfo import ZoneInfo
+                warsaw = ZoneInfo("Europe/Warsaw")
+            except Exception:
+                import pytz
+                warsaw = pytz.timezone("Europe/Warsaw")
+            try:
+                from datetime import timezone
+                meeting_utc = row.get('meeting_datetime')
+                if meeting_utc and isinstance(meeting_utc, datetime):
+                    # treat as UTC naive
+                    meeting_utc = meeting_utc.replace(tzinfo=None)
+                # convert to Warsaw by first assigning UTC then astimezone
+                try:
+                    from zoneinfo import ZoneInfo
+                    utc_tz = ZoneInfo("UTC")
+                except Exception:
+                    import pytz
+                    utc_tz = pytz.UTC
+                meeting_dt_pl = meeting_utc.replace(tzinfo=utc_tz).astimezone(warsaw) if meeting_utc else None
+            except Exception:
+                meeting_dt_pl = None
+
+            if not meeting_dt_pl:
+                await update.message.reply_text("🤔 Не удалось определить дату последней встречи.")
+                return
+
+            now_pl = datetime.now(warsaw)
+            days = (now_pl.date() - meeting_dt_pl.date()).days
+            if days < 0:
+                # meeting in the future — report accordingly
+                await update.message.reply_text("📅 Следующая встреча ещё впереди!")
+                return
+
+            # Playful phrasing
+            if days == 0:
+                msg = "🎉 Последняя встреча была сегодня!"
+            elif days == 1:
+                msg = "🕐 Последняя встреча была 1 день назад."
+            elif 2 <= days <= 4:
+                msg = f"🗓️ Последняя встреча была {days} дня назад."
+            else:
+                msg = f"📆 Последняя встреча была {days} дней назад."
+
+            # Optionally add date label from stored text
+            label = row.get('selected_option_text') or ""
+            if label:
+                msg += f"\n📝 {label}"
+
+            await update.message.reply_text(msg)
+        except Exception as e:
+            logger.error(f"Error in /days_since_meeting: {e}")
+            await update.message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
 
     async def die_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /die command — now with fun fantasy responses only"""
@@ -494,12 +578,6 @@ class SimplePollBot:
                 await query.answer("❌ Выбери хотя бы одно время!", show_alert=True)
                 return
             await self.create_final_poll(query, user_id, chat_id, context)
-        elif data.startswith("pin_yes_"):
-            poll_id = data.split("pin_yes_")[1]
-            await self.handle_pin_proposal(query, poll_id, True, context)
-        elif data.startswith("pin_no_"):
-            poll_id = data.split("pin_no_")[1]
-            await self.handle_pin_proposal(query, poll_id, False, context)
         elif data.startswith("ignore_yes_"):
             parts = data.split("ignore_yes_")[1].split("_", 1)
             poll_id = parts[0]
@@ -932,6 +1010,23 @@ class SimplePollBot:
                         logger.info(f"Cancelled {cancelled} 'poll_voting_timeout' tasks for chat {chat_id}")
                     except Exception as e:
                         logger.warning(f"Could not cancel voting timeout tasks for chat {chat_id}: {e}")
+
+                    # Persist meeting only after poll is closed
+                    try:
+                        if insert_or_update_meeting:
+                            from scheduled_tasks import parse_meeting_datetime_from_poll_result
+                            meeting_dt_pl = parse_meeting_datetime_from_poll_result(most_voted_result)
+                            if meeting_dt_pl is not None:
+                                insert_or_update_meeting(
+                                    chat_id=chat_id,
+                                    poll_id=poll_id,
+                                    meeting_datetime=meeting_dt_pl,
+                                    selected_option_text=most_voted_result,
+                                    confirmation_message_id=sent_message.message_id,
+                                    pinned_message_id=sent_message.message_id,
+                                )
+                    except Exception as e:
+                        logger.warning(f"Could not persist meeting for chat {chat_id}, poll {poll_id}: {e}")
 
                     # Pin the confirmation message
                     try:
@@ -1618,6 +1713,14 @@ class SimplePollBot:
             except Exception as db_error:
                 logger.error(f"Error cancelling database tasks for chat {chat_id}: {db_error}")
 
+            # Remove any future confirmed meetings for this chat
+            try:
+                from meeting_storage import delete_future_meetings_for_chat
+                removed = delete_future_meetings_for_chat(chat_id)
+                logger.info(f"Removed {removed} future meetings for chat {chat_id}")
+            except Exception as e:
+                logger.warning(f"Could not remove future meetings for chat {chat_id}: {e}")
+
             # Disable immediate confirmation buttons for this chat
             disabled_immediate_count = 0
             immediate_keys_to_remove = []
@@ -1996,52 +2099,6 @@ class SimplePollBot:
 
         if vote_state_keys_to_remove:
             logger.info(f"Cleaned up {len(vote_state_keys_to_remove)} user vote states for poll {poll_id}")
-
-    async def handle_cant_make_it_vote(self, poll_id, user_id, context):
-        """Handle when a user votes only for 'Не могу 😔'"""
-        try:
-            if poll_id not in self.active_polls:
-                return
-
-            poll_data = self.active_polls[poll_id]
-            chat_id = poll_data['chat_id']
-            vote_counts = poll_data['vote_counts']
-            target_member_count = poll_data.get('target_member_count', 1)
-
-            # Get user info to format username
-            try:
-                user_info = await context.bot.get_chat_member(chat_id, user_id)
-                user = user_info.user
-                if user.username:
-                    user_mention = f"@{user.username}"
-                else:
-                    # Fallback to first name if no username
-                    user_mention = f"[{user.first_name}](tg://user?id={user_id})"
-                    parse_mode = 'Markdown'
-            except:
-                # Fallback to user ID if can't get user info
-                user_mention = f"[{user_id}](tg://user?id={user_id})"
-                parse_mode = 'Markdown'
-
-            # Send notification about user not being able to attend
-            cant_make_it_message = f"{user_mention} не сможет присоединиться к встрече"
-            if user_mention.startswith('@'):
-                await context.bot.send_message(chat_id=chat_id, text=cant_make_it_message)
-            else:
-                await context.bot.send_message(chat_id=chat_id, text=cant_make_it_message, parse_mode='Markdown')
-
-            # Check if everyone has voted
-            all_voters = set()
-            for voters in vote_counts.values():
-                all_voters.update(voters)
-
-            if len(all_voters) >= target_member_count:
-                # Everyone has voted, ask if we should ignore this user and proceed
-                logger.info(f"Everyone voted, asking if should ignore user {user_id} and proceed")
-                await self.ask_ignore_user_and_proceed(poll_id, user_id, context)
-
-        except Exception as e:
-            logger.error(f"Error handling 'Не могу' vote: {e}")
 
     async def handle_cant_make_it_users(self, poll_id, cant_make_it_users, context):
         """Handle users who voted only 'Не могу' after everyone has voted"""
@@ -2836,6 +2893,23 @@ class SimplePollBot:
             except Exception as e:
                 logger.warning(f"Could not cancel voting timeout tasks for chat {chat_id}: {e}")
 
+            # Persist meeting only after poll is closed
+            try:
+                if insert_or_update_meeting:
+                    from scheduled_tasks import parse_meeting_datetime_from_poll_result
+                    meeting_dt_pl = parse_meeting_datetime_from_poll_result(option)
+                    if meeting_dt_pl is not None:
+                        insert_or_update_meeting(
+                            chat_id=chat_id,
+                            poll_id=poll_id,
+                            meeting_datetime=meeting_dt_pl,
+                            selected_option_text=option,
+                            confirmation_message_id=sent_message.message_id,
+                            pinned_message_id=sent_message.message_id,
+                        )
+            except Exception as e:
+                logger.warning(f"Could not persist meeting for chat {chat_id}, poll {poll_id}: {e}")
+
             # Clean up poll data
             self.cleanup_poll_data(poll_id)
             del self.active_polls[poll_id]
@@ -2922,139 +2996,6 @@ class SimplePollBot:
         except Exception as e:
             logger.error(f"Error closing poll and cleaning up: {e}")
 
-    async def handle_pin_proposal(self, query, poll_id, should_pin, context):
-        """Handle yes/no response to pin proposal"""
-        try:
-            await query.answer()
-
-            if poll_id not in self.active_polls:
-                await query.edit_message_text("❌ Опрос не найден.")
-                return
-
-            poll_data = self.active_polls[poll_id]
-            proposal_data = poll_data.get('proposal')
-
-            if not proposal_data:
-                await query.edit_message_text("❌ Предложение не найдено.")
-                return
-
-            proposed_option = proposal_data['proposed_option']
-            chat_id = poll_data['chat_id']
-
-            if should_pin:
-                # Early guard: if the chosen meeting time is already in the past, cancel and inform
-                try:
-                    handled = await self.meeting_in_past_guard(poll_id, chat_id, context, proposed_option)
-                    if handled:
-                        return
-                except Exception as e:
-                    logger.warning(f"Past-meeting guard error in handle_pin_proposal for poll {poll_id}: {e}")
-
-                # Pin the meeting confirmation and schedule reminders
-                confirmation_message = f"Собираемся в {proposed_option}"
-
-                sent_message = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=confirmation_message
-                )
-
-                # Pin the confirmation message
-                try:
-                    await context.bot.pin_chat_message(
-                        chat_id=chat_id,
-                        message_id=sent_message.message_id,
-                        disable_notification=True
-                    )
-                    logger.info(f"Pinned proposal confirmation message in chat {chat_id}")
-
-                    # Store pinned message info for later unpinning
-                    self.pinned_messages[f"{chat_id}_{poll_id}"] = {
-                        'chat_id': chat_id,
-                        'message_id': sent_message.message_id
-                    }
-                except Exception as e:
-                    logger.warning(f"Could not pin proposal message in chat {chat_id}: {e}")
-
-                # Get all voters from the poll
-                poll_voters = set()
-                if poll_id in self.active_polls:
-                    poll_data = self.active_polls[poll_id]
-                    if 'vote_counts' in poll_data:
-                        # Extract all voters from vote_counts (which contains voters by option)
-                        for option_text, voters in poll_data['vote_counts'].items():
-                            poll_voters.update(voters)
-                        # Exclude bots from voters
-                        try:
-                            bot_info = await context.bot.get_me()
-                            bot_user_id = bot_info.id
-                            poll_voters.discard(bot_user_id)
-                        except Exception as e:
-                            logger.warning(f"Could not get bot info to exclude from voters: {e}")
-
-                # Schedule reminders for the proposed meeting
-                confirmation_task = asyncio.create_task(
-                    self.schedule_confirmation_message(poll_id, chat_id, context, proposed_option, poll_voters))
-                
-                # Schedule unpin message using ScheduledTaskManager
-                try:
-                    from scheduled_tasks import ScheduledTaskManager
-                    from datetime import datetime
-                    
-                    # Parse the proposed option to get meeting datetime
-                    meeting_datetime = self.parse_meeting_time(proposed_option)
-                    if meeting_datetime:
-                        ScheduledTaskManager.schedule_unpin_message(
-                            chat_id=chat_id,
-                            poll_id=poll_id,
-                            meeting_datetime=meeting_datetime,
-                            message_id=sent_message.message_id
-                        )
-                        logger.info(f"Scheduled unpin task for meeting at {meeting_datetime}")
-                    else:
-                        logger.warning(f"Could not parse meeting time from: {proposed_option}")
-                except ImportError:
-                    logger.warning("ScheduledTaskManager not available - unpin task not scheduled")
-                except Exception as e:
-                    logger.error(f"Error scheduling unpin task: {e}")
-                
-                followup_task = asyncio.create_task(self.schedule_followup_message(chat_id, context, proposed_option))
-
-                # Track scheduled tasks for this chat
-                if chat_id not in self.scheduled_tasks:
-                    self.scheduled_tasks[chat_id] = []
-                self.scheduled_tasks[chat_id].extend([
-                    {'task': confirmation_task, 'type': 'confirmation', 'poll_id': poll_id},
-                    {'task': followup_task, 'type': 'followup', 'poll_id': poll_id}
-                ])
-                # Note: unpin task is now handled by ScheduledTaskManager, not asyncio
-
-                await query.edit_message_text(
-                    f"✅ Встреча запланирована: {proposed_option}\n📌 Сообщение закреплено и напоминания настроены!")
-
-                # Close the poll since meeting is confirmed
-                try:
-                    poll_message_id = poll_data['poll_message_id']
-                    await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
-                    try:
-                        if set_poll_closed:
-                            set_poll_closed(poll_id, True)
-                    except Exception as e:
-                        logger.warning(f"DB set_poll_closed failed for {poll_id}: {e}")
-                    logger.info(f"Closed poll {poll_id} after proposal confirmation")
-                except Exception as e:
-                    logger.warning(f"Could not close poll {poll_id}: {e}")
-
-            else:
-                await query.edit_message_text(f"❌ Встреча не запланирована. Опрос продолжается.")
-
-            # Clean up proposal data
-            if 'proposal' in poll_data:
-                del poll_data['proposal']
-
-        except Exception as e:
-            logger.error(f"Error handling pin proposal: {e}")
-            await query.edit_message_text("❌ Произошла ошибка при обработке ответа.")
-
 
 def main():
     """Main function"""
@@ -3076,6 +3017,7 @@ def main():
     app.add_handler(CommandHandler("info", bot.info_command))
     app.add_handler(CommandHandler("create_poll", bot.create_poll))
     app.add_handler(CommandHandler("cancel_bot", bot.cancel_bot))
+    app.add_handler(CommandHandler("days_since_meeting", bot.days_since_last_meeting))
     app.add_handler(CommandHandler("die", bot.die_command))
     app.add_handler(CommandHandler("subscribe", handle_subscribe))
     app.add_handler(CommandHandler("unsubscribe", handle_unsubscribe))

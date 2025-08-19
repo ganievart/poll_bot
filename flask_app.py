@@ -184,6 +184,7 @@ async def initialize_bot_async():
         bot_application.add_handler(CommandHandler("create_poll", bot_instance.create_poll))
         bot_application.add_handler(CommandHandler("cancel_bot", bot_instance.cancel_bot))
         bot_application.add_handler(CommandHandler("die", bot_instance.die_command))
+        bot_application.add_handler(CommandHandler("days_since_meeting", bot_instance.days_since_last_meeting))
         
         # Import and add subscribe handlers
         try:
