@@ -1765,19 +1765,16 @@ class SimplePollBot:
             for pin_key in pinned_keys_to_remove:
                 del self.pinned_messages[pin_key]
 
-            # Send confirmation message
-            response_text = (
-                f"🛑 Бот отменён для этого чата!\n\n"
-                f"📋 Отменено задач: {cancelled_count}\n"
-                f"🗳️ Очищено опросов: {polls_cleared}\n"
-                f"💬 Очищено подтверждений: {confirmations_cleared}\n"
-                f"🗄️ Отменено запланированных задач в БД: {cancelled_db_tasks}\n"
-                f"⏰ Отключено немедленных подтверждений: {disabled_immediate_count}\n"
-                f"📌 Откреплено сообщений: {unpinned_count}\n\n"
-                f"Используйте /create_poll чтобы создать новый опрос."
-            )
-
-            await update.message.reply_text(response_text)
+            # Send short playful confirmation message (randomized)
+            import random
+            messages = [
+                "🧹 Всё почистил! Опросы закрыты, задачи отменены. Можно начать заново с /create_poll",
+                "🛑 Стоп машина! Все опросы закрыты, все напоминания отменены. Готовы к свежему старту: /create_poll",
+                "✅ Готово: опросы закрыты, расписание очищено. Зовите новый /create_poll",
+                "✂️ Перерезал все ниточки — задачи отменены, опросы закрыты. Вперёд к новому /create_poll",
+                "🎈 Чистый лист! Всё отменено и закрыто. Создать новый? /create_poll",
+            ]
+            await update.message.reply_text(random.choice(messages))
             logger.info(
                 f"Bot cancelled for chat {chat_id} - {cancelled_count} tasks cancelled, {polls_cleared} polls cleared, {confirmations_cleared} confirmations cleared, {unpinned_count} messages unpinned")
 
@@ -2320,7 +2317,7 @@ class SimplePollBot:
             else:
                 immediate_conf_data['declined_users'].add(user_id)
                 # User won't be able to join - send separate message
-                response_text = f"{user_mention} не сможет присоединиться к встрече. Вы можете отменить встречу командой /cancel_bot"
+                response_text = f"❌ {user_mention} не подтвердил участие."
                 logger.info(f"User {user_id} won't be able to join for immediate confirmation in chat {chat_id}")
 
             # Send response message
@@ -2349,7 +2346,7 @@ class SimplePollBot:
             except Exception as e:
                 logger.warning(f"Could not persist updated immediate confirmation: {e}")
 
-            # Check if everyone who voted in the original poll has confirmed "yes"
+            # Check if everyone who voted in the original poll has confirmed "yes" or if there are declines
             await self.check_if_everyone_confirmed(immediate_conf_id, context)
 
             # Just answer the callback to acknowledge the button press
@@ -2409,6 +2406,43 @@ class SimplePollBot:
                 )
 
                 logger.info(f"Everyone confirmed for immediate confirmation {immediate_conf_id}")
+            elif declined_users:
+                # At least one person declined — inform once with cancellation hint and mention who declined
+                if not conf_data.get('decline_notified'):
+                    try:
+                        # Build mentions for declined users
+                        declined_mentions = []
+                        use_markdown = False
+                        for uid in list(declined_users):
+                            try:
+                                user_info = await context.bot.get_chat_member(chat_id, uid)
+                                u = user_info.user
+                                if getattr(u, 'username', None):
+                                    declined_mentions.append(f"@{u.username}")
+                                else:
+                                    declined_mentions.append(f"[{u.first_name}](tg://user?id={uid})")
+                                    use_markdown = True
+                            except Exception:
+                                declined_mentions.append(f"[User {uid}](tg://user?id={uid})")
+                                use_markdown = True
+                        # Format list nicely
+                        if not declined_mentions:
+                            declined_text = "кто-то"
+                        elif len(declined_mentions) == 1:
+                            declined_text = declined_mentions[0]
+                        else:
+                            declined_text = ", ".join(declined_mentions[:-1]) + f" и {declined_mentions[-1]}"
+                        notice = (
+                            f"Не все подтвердили участие. Отказались: {declined_text}. "
+                            f"Вы можете отменить встречу командой /cancel_bot."
+                        )
+                        if use_markdown:
+                            await context.bot.send_message(chat_id=chat_id, text=notice, parse_mode='Markdown')
+                        else:
+                            await context.bot.send_message(chat_id=chat_id, text=notice)
+                    except Exception as e:
+                        logger.warning(f"Could not send decline notice for {immediate_conf_id}: {e}")
+                    conf_data['decline_notified'] = True
 
         except Exception as e:
             logger.error(f"Error checking if everyone confirmed: {e}")
