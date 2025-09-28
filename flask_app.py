@@ -562,21 +562,22 @@ def run_scheduled_tasks():
             chat_id = p['chat_id']
             poll_id = p['poll_id']
             poll_msg_id = p.get('poll_message_id')
-            # Send playful message and try to stop poll
+            # First try to stop poll, then send playful message only if successful
+            loop = get_or_create_event_loop()
             try:
-                playful = (
-                    "⏳ Этот опрос был открыт уже 2 дня — закрываю его.\n"
-                    "Если нужно, создайте новый с /create_poll"
-                )
-                loop = get_or_create_event_loop()
-                loop.run_until_complete(bot_application.bot.send_message(chat_id=chat_id, text=playful))
+                if poll_msg_id:
+                    loop.run_until_complete(bot_application.bot.stop_poll(chat_id=chat_id, message_id=poll_msg_id))
+                # If no exception from stop_poll, send playful message
                 try:
-                    if poll_msg_id:
-                        loop.run_until_complete(bot_application.bot.stop_poll(chat_id=chat_id, message_id=poll_msg_id))
+                    playful = (
+                        "⏳ Этот опрос был открыт уже 2 дня — закрываю его.\n"
+                        "Если нужно, создайте новый с /create_poll"
+                    )
+                    loop.run_until_complete(bot_application.bot.send_message(chat_id=chat_id, text=playful))
                 except Exception as e:
-                    logger.warning(f"Could not stop poll {poll_id} in chat {chat_id}: {e}")
+                    logger.warning(f"Could not send playful close message for {poll_id} in chat {chat_id}: {e}")
             except Exception as e:
-                logger.warning(f"Could not send playful close message for {poll_id} in chat {chat_id}: {e}")
+                logger.warning(f"Could not stop poll {poll_id} in chat {chat_id}: {e}")
             # Mark DB closed regardless of telegram success to avoid repeats
             try:
                 set_poll_closed(poll_id, True)

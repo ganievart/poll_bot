@@ -99,7 +99,22 @@ def set_poll_closed(poll_id: str, closed: bool = True) -> None:
     conn = get_db_connection()
     cur = conn.cursor()
     try:
+        # Log connection details
         cur.execute("UPDATE polls SET is_closed=%s WHERE poll_id=%s", (closed, poll_id))
+        rows_affected = cur.rowcount
+
+        # Verify in same connection
+        cur.execute("SELECT is_closed FROM polls WHERE poll_id=%s", (poll_id,))
+        result = cur.fetchone()
+        logger.info(f"is_closed value after update: {result[0] if result else 'NOT FOUND'}")
+
+        if rows_affected > 0:
+            logger.info(f"Successfully updated poll {poll_id} closed status to {closed}")
+        else:
+            logger.warning(f"No rows updated for poll {poll_id}")
+    except Exception as e:
+        logger.error(f"Error updating poll {poll_id}: {e}")
+        raise
     finally:
         cur.close(); conn.close()
 
@@ -139,11 +154,16 @@ def get_expired_open_polls(days: int = 2) -> List[Dict[str, Any]]:
     cur = conn.cursor(dictionary=True)
     try:
         cur.execute(
-            "SELECT poll_id, chat_id, poll_message_id, question, created_at FROM polls WHERE is_closed = FALSE AND created_at < DATE_SUB(NOW(), INTERVAL %s DAY)",
+            "SELECT poll_id, chat_id, poll_message_id, question, created_at, is_closed FROM polls WHERE is_closed = FALSE AND created_at < DATE_SUB(NOW(), INTERVAL %s DAY)",
             (days,)
         )
         rows = cur.fetchall() or []
-        return rows
+        logger.info(f"Found {len(rows)} expired open polls (days={days})")
+        if rows:
+            logger.warning(f"Expired open polls details: {[(r['poll_id'], r['is_closed'], r['created_at']) for r in rows]}")
+
+        # Return only the originally requested columns
+        return [{k: v for k, v in row.items() if k != 'is_closed'} for row in rows]
     finally:
         cur.close(); conn.close()
 

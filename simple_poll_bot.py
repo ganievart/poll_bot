@@ -997,7 +997,11 @@ class SimplePollBot:
                         await context.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
                         try:
                             if set_poll_closed:
+                                logger.info(f"About to call set_poll_closed({poll_id}, True)")
                                 set_poll_closed(poll_id, True)
+                                logger.info(f"Successfully called set_poll_closed({poll_id}, True)")
+                            else:
+                                logger.warning(f"set_poll_closed function is None - cannot mark poll {poll_id} as closed")
                         except Exception as e:
                             logger.warning(f"DB set_poll_closed failed for {poll_id}: {e}")
                         logger.info(f"Closed poll {poll_id} in chat {chat_id}")
