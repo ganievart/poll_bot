@@ -610,7 +610,7 @@ class SimplePollBot:
         today = datetime.now()
 
         keyboard = []
-        for i in range(7):
+        for i in range(10):
             day = today + timedelta(days=i)
             day_name = self.get_day_name(day)
             date_str = day.strftime("%d.%m")
@@ -634,7 +634,7 @@ class SimplePollBot:
         today = datetime.now()
 
         keyboard = []
-        for i in range(7):
+        for i in range(10):
             day = today + timedelta(days=i)
             day_name = self.get_day_name(day)
             date_str = day.strftime("%d.%m")
