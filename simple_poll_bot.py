@@ -117,9 +117,26 @@ try:
         insert_or_update_meeting = None
         logger.warning("meeting_storage not available; meetings will not be persisted")
 
-    # Placeholders for removed immediate confirmation storage functions
-    upsert_immediate_confirmation = None
-    get_immediate_confirmation = None
+    # Immediate confirmation storage functions
+    try:
+        from immediate_confirmation_storage import (
+            upsert_immediate_confirmation,
+            get_immediate_confirmation,
+            get_all_pending_confirmations,
+            update_confirmation_response,
+            complete_immediate_confirmation,
+            cancel_immediate_confirmation,
+            check_all_confirmed
+        )
+    except ImportError:
+        upsert_immediate_confirmation = None
+        get_immediate_confirmation = None
+        get_all_pending_confirmations = None
+        update_confirmation_response = None
+        complete_immediate_confirmation = None
+        cancel_immediate_confirmation = None
+        check_all_confirmed = None
+        logger.warning("immediate_confirmation_storage not available; confirmations will not persist across restarts")
 except ImportError:
     print("❌ python-telegram-bot not installed!")
     print("📝 Install it with: py -m pip install python-telegram-bot")
@@ -183,6 +200,31 @@ class SimplePollBot:
                 logger.info(f"Rehydrated {len(open_polls)} open polls from DB")
         except Exception as e:
             logger.warning(f"Could not rehydrate polls from DB: {e}")
+
+        # Try to rehydrate immediate confirmations from DB
+        try:
+            if get_all_pending_confirmations:
+                pending_confirmations = get_all_pending_confirmations()
+                for conf in pending_confirmations:
+                    chat_id = conf['chat_id']
+                    message_id = conf['message_id']
+                    immediate_conf_id = f"immediate_{chat_id}_{message_id}"
+                    
+                    self.immediate_confirmation_messages[immediate_conf_id] = {
+                        'chat_id': chat_id,
+                        'message_id': message_id,
+                        'poll_result': conf['poll_result'],
+                        'poll_id': conf['poll_id'],
+                        'all_voters': conf['all_voters'],
+                        'confirmed_users': conf['confirmed_users'],
+                        'declined_users': conf['declined_users'],
+                        'context': None  # Will be set when needed
+                    }
+                
+                if pending_confirmations:
+                    logger.info(f"Rehydrated {len(pending_confirmations)} immediate confirmations from DB")
+        except Exception as e:
+            logger.warning(f"Could not rehydrate immediate confirmations from DB: {e}")
 
     def start_cleanup_task(self):
         """Start the session cleanup task if not already running"""
@@ -1964,7 +2006,7 @@ class SimplePollBot:
                         chat_id=chat_id,
                         message_id=message.message_id,
                         poll_result=poll_result,
-                        poll_id=None,
+                        poll_id=poll_id,
                         all_voters=poll_voters or set(),
                         confirmed_users=set(),
                         declined_users=set(),
@@ -2206,24 +2248,111 @@ class SimplePollBot:
     # Removed: check_thumbs_up_threshold function - no reaction tracking needed
 
     async def handle_proceed_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-        """Handle proceed confirmation buttons"""
+        """Handle immediate confirmation button responses with persistent storage"""
         query = update.callback_query
         user_id = update.effective_user.id
-
-        # Decide which flow to use (immediate confirmation vs regular proceed)
+        
+        logger.info(f"Proceed button pressed by user {user_id}: {data}")
+        
         # Immediate confirmation pattern: proceed_yes_<chat_id>_<timestamp> or proceed_no_<chat_id>_<timestamp>
-        try:
-            import re
-            m = re.match(r"^proceed_(yes|no)_(-?\d+)_(\d+)$", data)
-            if m:
-                action = m.group(1)
-                chat_id = int(m.group(2))
-                # timestamp = m.group(3)  # not used, but validates format
-                await self.handle_immediate_confirmation_button(action, chat_id, user_id, query, context)
+        if data.startswith('proceed_yes_') or data.startswith('proceed_no_'):
+            parts = data.split('_')
+            if len(parts) >= 4:
+                action = parts[1]  # 'yes' or 'no'
+                chat_id = int(parts[2])
+                timestamp = parts[3]
+                
+                message_id = query.message.message_id
+                immediate_conf_id = f"immediate_{chat_id}_{message_id}"
+                
+                # Try to update response in database
+                if update_confirmation_response:
+                    success = update_confirmation_response(chat_id, message_id, user_id, action)
+                    
+                    if not success:
+                        # Failed to update (expired, duplicate, or not found)
+                        await query.answer("❌ Подтверждение не найдено или устарело", show_alert=True)
+                        logger.warning(f"Failed to update confirmation response for user {user_id} in chat {chat_id}")
+                        return
+                    
+                    # Successfully updated - provide user feedback
+                    if action == 'yes':
+                        await query.answer("✅ Вы подтвердили участие!")
+                        logger.info(f"User {user_id} confirmed attendance for chat {chat_id}")
+                    elif action == 'no':
+                        await query.answer("❌ Вы отменили участие")
+                        logger.info(f"User {user_id} declined attendance for chat {chat_id}")
+                    
+                    # Get updated confirmation data to check completion
+                    if get_immediate_confirmation:
+                        conf_data = get_immediate_confirmation(chat_id, message_id)
+                        
+                        if conf_data and check_all_confirmed:
+                            # Check if everyone confirmed
+                            if check_all_confirmed(conf_data):
+                                # Everyone confirmed! Send success message
+                                try:
+                                    success_message = await context.bot.send_message(
+                                        chat_id=chat_id,
+                                        text="🎉 Отлично! Встреча состоится!"
+                                    )
+                                    logger.info(f"All users confirmed for chat {chat_id}, sent success message")
+                                    
+                                    # Mark as completed in database
+                                    if complete_immediate_confirmation:
+                                        complete_immediate_confirmation(chat_id, message_id, success_message.message_id)
+                                    
+                                    # Clean up in-memory state
+                                    if immediate_conf_id in self.immediate_confirmation_messages:
+                                        del self.immediate_confirmation_messages[immediate_conf_id]
+                                    
+                                except Exception as e:
+                                    logger.error(f"Error sending success message: {e}")
+                        
+                        # Update in-memory state if it exists
+                        if immediate_conf_id in self.immediate_confirmation_messages:
+                            self.immediate_confirmation_messages[immediate_conf_id]['confirmed_users'] = conf_data['confirmed_users']
+                            self.immediate_confirmation_messages[immediate_conf_id]['declined_users'] = conf_data['declined_users']
+                
+                else:
+                    # Fallback to in-memory only (if database not available)
+                    if immediate_conf_id in self.immediate_confirmation_messages:
+                        conf_data = self.immediate_confirmation_messages[immediate_conf_id]
+                        
+                        # Check for duplicate responses
+                        if action == 'yes' and user_id in conf_data['confirmed_users']:
+                            await query.answer("Вы уже подтвердили участие!", show_alert=True)
+                            return
+                        if action == 'no' and user_id in conf_data['declined_users']:
+                            await query.answer("Вы уже отменили участие!", show_alert=True)
+                            return
+                        
+                        # Update in-memory state
+                        if action == 'yes':
+                            conf_data['confirmed_users'].add(user_id)
+                            conf_data['declined_users'].discard(user_id)
+                            await query.answer("✅ Вы подтвердили участие!")
+                        elif action == 'no':
+                            conf_data['declined_users'].add(user_id)
+                            conf_data['confirmed_users'].discard(user_id)
+                            await query.answer("❌ Вы отменили участие")
+                        
+                        # Check if everyone confirmed
+                        if len(conf_data['confirmed_users']) >= len(conf_data['all_voters']):
+                            try:
+                                success_message = await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text="🎉 Отлично! Встреча состоится!"
+                                )
+                                del self.immediate_confirmation_messages[immediate_conf_id]
+                            except Exception as e:
+                                logger.error(f"Error sending success message: {e}")
+                    else:
+                        await query.answer("❌ Подтверждение не найдено или устарело", show_alert=True)
+                        logger.warning(f"Immediate confirmation {immediate_conf_id} not found for user {user_id}")
+                
                 return
-        except Exception:
-            pass
-
+        
         # Regular proceed pattern: proceed_yes_<poll_id> or proceed_no_<poll_id>
         parts = data.split('_', 2)
         if len(parts) >= 3 and parts[0] == 'proceed' and parts[1] in ('yes', 'no'):
