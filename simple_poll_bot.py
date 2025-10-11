@@ -2016,9 +2016,24 @@ class SimplePollBot:
 
             logger.info(
                 f"Sent immediate confirmation with inline keyboard: '{confirmation_text}' (ID: {immediate_conf_id})")
+            
+            # Schedule button removal task 24 hours from now
+            try:
+                from scheduled_tasks import ScheduledTaskManager
+                ScheduledTaskManager.schedule_button_removal(
+                    chat_id=chat_id,
+                    message_id=message.message_id,
+                    poll_id=poll_id
+                )
+                logger.info(f"Scheduled button removal for message {message.message_id} in chat {chat_id}")
+            except Exception as e:
+                logger.warning(f"Could not schedule button removal task: {e}")
+            
+            return message
 
         except Exception as e:
             logger.error(f"Error sending immediate confirmation message: {e}")
+            return None
 
     async def monitor_poll_voting(self, poll_id):
         """Monitor poll voting for 1 hour and ping non-voters - now stores task in database"""

@@ -298,6 +298,46 @@ class ScheduledTaskManager:
         except Exception as e:
             logger.error(f"Error scheduling session cleanup: {e}")
             return False
+    
+    @staticmethod
+    def schedule_button_removal(chat_id: int, message_id: int, poll_id: str = None) -> bool:
+        """
+        Schedule button removal for immediate confirmation message (24 hours from now)
+        
+        Args:
+            chat_id: Telegram chat ID
+            message_id: Telegram message ID of the confirmation message
+            poll_id: Optional poll ID for reference
+            
+        Returns:
+            bool: True if scheduled successfully, False if database error
+        """
+        try:
+            if not add_scheduled_task:
+                logger.error("Database scheduling not available - cannot schedule button removal")
+                return False
+            
+            # Schedule button removal 24 hours from now (UTC)
+            from datetime import timezone
+            removal_time = (datetime.now(timezone.utc) + timedelta(hours=24)).replace(tzinfo=None)
+            
+            # Store message ID in task_data for the removal task
+            task_data = str(message_id)
+            
+            task_id = add_scheduled_task(
+                chat_id=chat_id,
+                poll_id=poll_id,
+                task_type="button_removal",
+                scheduled_time=removal_time,
+                task_data=task_data
+            )
+            
+            logger.info(f"Stored button removal task {task_id} for chat {chat_id}, message {message_id} (UTC): {removal_time}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error scheduling button removal: {e}")
+            return False
 
 
 # Task execution functions (used by Flask app)
@@ -359,7 +399,21 @@ class TaskExecutor:
                     logger.warning(f"Could not reconstruct poll voters for {poll_id}: {db_err}")
                     poll_voters = set()
 
-                await bot_instance.send_confirmation_message(chat_id, poll_result, bot_application, poll_voters if poll_voters else None, poll_id=poll_id)
+                # Send confirmation message and get the message object
+                confirmation_message = await bot_instance.send_confirmation_message(chat_id, poll_result, bot_application, poll_voters if poll_voters else None, poll_id=poll_id)
+                
+                # Schedule button removal task 24 hours from now
+                if confirmation_message and hasattr(confirmation_message, 'message_id'):
+                    try:
+                        from scheduled_tasks import ScheduledTaskManager
+                        ScheduledTaskManager.schedule_button_removal(
+                            chat_id=chat_id,
+                            message_id=confirmation_message.message_id,
+                            poll_id=poll_id
+                        )
+                        logger.info(f"Scheduled button removal for message {confirmation_message.message_id} in chat {chat_id}")
+                    except Exception as e:
+                        logger.warning(f"Could not schedule button removal task: {e}")
             else:
                 # Fallback: format message with 'Сегодня/Завтра' prefix and trimmed time if today
                 try:
@@ -447,6 +501,36 @@ class TaskExecutor:
             logger.error(f"Error executing voting timeout task for chat {chat_id}: {e}")
             raise
     
+    @staticmethod
+    async def execute_button_removal_task(chat_id: int, message_id_str: str, bot_application):
+        """Execute button removal task for immediate confirmation message"""
+        try:
+            # Parse message ID
+            try:
+                message_id = int(message_id_str) if message_id_str and message_id_str.isdigit() else None
+            except:
+                message_id = None
+            
+            if message_id is None:
+                logger.error(f"Invalid message ID for button removal task: {message_id_str}")
+                return
+            
+            # Remove buttons by editing the message without reply_markup
+            try:
+                await bot_application.bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=None
+                )
+                logger.info(f"Successfully removed buttons for message {message_id} in chat {chat_id}")
+            except Exception as e:
+                # This is expected if buttons were already removed or message doesn't exist
+                logger.info(f"Could not remove buttons for message {message_id} in chat {chat_id}: {e}")
+            
+        except Exception as e:
+            logger.error(f"Error executing button removal task for chat {chat_id}: {e}")
+            raise
+
 
 def parse_meeting_datetime_from_poll_result(poll_result: str) -> Optional[datetime]:
     """

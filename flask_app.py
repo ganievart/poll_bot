@@ -632,6 +632,10 @@ def run_scheduled_tasks():
                     loop.run_until_complete(
                         cleanup_sessions_task()
                     )
+                elif task_type == 'button_removal':
+                    loop.run_until_complete(
+                        remove_buttons_task(chat_id, task_data)
+                    )
                 else:
                     logger.warning(f"Unknown task type: {task_type}")
                     errors.append(f"Unknown task type: {task_type} for task {task_id}")
@@ -686,6 +690,14 @@ async def send_confirmation_task(chat_id: int, poll_result: str, poll_id: str):
         raise Exception("Task executor not available")
     
     await TaskExecutor.execute_confirmation_task(chat_id, poll_result, poll_id, bot_instance, bot_application)
+
+
+async def remove_buttons_task(chat_id: int, message_id_str: str):
+    """Remove buttons from immediate confirmation message using centralized task executor"""
+    if not task_executor_available:
+        raise Exception("Task executor not available")
+    
+    await TaskExecutor.execute_button_removal_task(chat_id, message_id_str, bot_application)
 
 
 async def send_followup_task(chat_id: int, poll_result: str):

@@ -15,7 +15,8 @@ CREATE TABLE scheduled_tasks (
         'followup', 
         'unpin_message',
         'poll_voting_timeout',
-        'session_cleanup'
+        'session_cleanup',
+        'button_removal'
     ) NOT NULL,
     scheduled_time DATETIME NOT NULL,
     is_executed BOOLEAN DEFAULT FALSE,
