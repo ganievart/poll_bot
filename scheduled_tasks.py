@@ -399,21 +399,7 @@ class TaskExecutor:
                     logger.warning(f"Could not reconstruct poll voters for {poll_id}: {db_err}")
                     poll_voters = set()
 
-                # Send confirmation message and get the message object
-                confirmation_message = await bot_instance.send_confirmation_message(chat_id, poll_result, bot_application, poll_voters if poll_voters else None, poll_id=poll_id)
-                
-                # Schedule button removal task 24 hours from now
-                if confirmation_message and hasattr(confirmation_message, 'message_id'):
-                    try:
-                        from scheduled_tasks import ScheduledTaskManager
-                        ScheduledTaskManager.schedule_button_removal(
-                            chat_id=chat_id,
-                            message_id=confirmation_message.message_id,
-                            poll_id=poll_id
-                        )
-                        logger.info(f"Scheduled button removal for message {confirmation_message.message_id} in chat {chat_id}")
-                    except Exception as e:
-                        logger.warning(f"Could not schedule button removal task: {e}")
+                await bot_instance.send_confirmation_message(chat_id, poll_result, bot_application, poll_voters if poll_voters else None, poll_id=poll_id)
             else:
                 # Fallback: format message with 'Сегодня/Завтра' prefix and trimmed time if today
                 try:
