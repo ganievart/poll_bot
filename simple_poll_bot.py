@@ -2446,12 +2446,17 @@ class SimplePollBot:
                 import random
                 playful_message = random.choice(playful_messages)
 
-                await context.bot.send_message(
+                success_message = await context.bot.send_message(
                     chat_id=chat_id,
                     text=playful_message
                 )
 
                 logger.info(f"Everyone confirmed for immediate confirmation {immediate_conf_id}")
+                
+                # Mark as completed in database immediately
+                if complete_immediate_confirmation:
+                    complete_immediate_confirmation(chat_id, conf_data['message_id'], success_message.message_id)
+                    logger.info(f"Immediate confirmation marked as completed in database")
             elif declined_users:
                 # At least one person declined — inform once with cancellation hint and mention who declined
                 if not conf_data.get('decline_notified'):
