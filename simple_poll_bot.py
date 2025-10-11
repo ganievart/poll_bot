@@ -2432,6 +2432,23 @@ class SimplePollBot:
                 logger.info(f"No voter data available for immediate confirmation {immediate_conf_id}")
                 return
 
+            # Check if everyone has voted (regardless of yes/no)
+            total_voters = len(all_voters)
+            total_responses = len(confirmed_users) + len(declined_users)
+            
+            # If everyone has voted, remove the buttons
+            if total_responses >= total_voters:
+                try:
+                    # Remove buttons by editing the message without reply_markup
+                    await context.bot.edit_message_reply_markup(
+                        chat_id=chat_id,
+                        message_id=conf_data['message_id'],
+                        reply_markup=None
+                    )
+                    logger.info(f"Removed buttons for immediate confirmation {immediate_conf_id} - everyone has voted")
+                except Exception as e:
+                    logger.warning(f"Could not remove buttons for immediate confirmation {immediate_conf_id}: {e}")
+
             # Check if everyone who voted has confirmed "yes"
             if all_voters.issubset(confirmed_users):
                 # Everyone confirmed! Send playful message
