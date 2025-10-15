@@ -741,15 +741,28 @@ async def send_followup_task(chat_id: int, poll_result: str):
 async def unpin_message_task(chat_id: int, message_id: int = None):
     """Unpin meeting confirmation message"""
     try:
-        if message_id:
-            await bot_application.bot.unpin_chat_message(
-                chat_id=chat_id,
-                message_id=message_id
-            )
-            logger.info(f"Unpinned message {message_id} in chat {chat_id}")
+        # Always resolve the latest pinned message id from DB (ignore provided message_id)
+        try:
+            from poll_storage import get_pinned_messages_by_chat
+            rows = get_pinned_messages_by_chat(chat_id, limit=1)
+            resolved_id = int(rows[0]['pinned_message_id']) if rows and rows[0].get('pinned_message_id') else None
+        except Exception as e:
+            logger.warning(f"Could not fetch pinned message id from DB for chat {chat_id}: {e}")
+            resolved_id = None
+
+        if resolved_id:
+            try:
+                await bot_application.bot.unpin_chat_message(
+                    chat_id=chat_id,
+                    message_id=resolved_id
+                )
+                logger.info(f"Unpinned message {resolved_id} in chat {chat_id} (resolved from DB)")
+            except Exception as e:
+                logger.error(f"Error unpinning resolved message {resolved_id} in chat {chat_id}: {e}")
+                raise
         else:
-            # Skip mass unpin if no specific message ID is provided
-            logger.info(f"No message_id provided for unpin in chat {chat_id}; skipping unpin_all by design")
+            # No ID found; intentionally skip mass unpin
+            logger.info(f"No pinned message id resolved from DB for chat {chat_id}; skipping unpin")
         
     except Exception as e:
         logger.error(f"Error unpinning message in chat {chat_id}: {e}")
