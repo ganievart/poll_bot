@@ -748,9 +748,8 @@ async def unpin_message_task(chat_id: int, message_id: int = None):
             )
             logger.info(f"Unpinned message {message_id} in chat {chat_id}")
         else:
-            # Unpin all messages if no specific message ID
-            await bot_application.bot.unpin_all_chat_messages(chat_id=chat_id)
-            logger.info(f"Unpinned all messages in chat {chat_id}")
+            # Skip mass unpin if no specific message ID is provided
+            logger.info(f"No message_id provided for unpin in chat {chat_id}; skipping unpin_all by design")
         
     except Exception as e:
         logger.error(f"Error unpinning message in chat {chat_id}: {e}")

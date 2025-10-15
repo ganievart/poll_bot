@@ -148,6 +148,28 @@ def get_open_polls() -> List[Dict[str, Any]]:
         cur.close(); conn.close()
 
 
+def get_pinned_messages_by_chat(chat_id: int, limit: int = 1) -> List[Dict[str, Any]]:
+    """Return latest poll for a chat that has a pinned_message_id set.
+    Results are ordered by created_at DESC and limited to the most recent by default.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            """
+            SELECT poll_id, chat_id, pinned_message_id
+            FROM polls
+            WHERE chat_id = %s AND pinned_message_id IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (int(chat_id), int(max(1, limit)))
+        )
+        rows = cur.fetchall() or []
+        return rows
+    finally:
+        cur.close(); conn.close()
+
 def get_expired_open_polls(days: int = 2) -> List[Dict[str, Any]]:
     """Return polls still open whose created_at is older than NOW() - INTERVAL days."""
     conn = get_db_connection()

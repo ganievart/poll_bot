@@ -1811,25 +1811,42 @@ class SimplePollBot:
             for immediate_id in immediate_keys_to_remove:
                 del self.immediate_confirmation_messages[immediate_id]
 
-            # Unpin all pinned messages for this chat
+            # Unpin pinned confirmation messages for this chat
             unpinned_count = 0
             pinned_keys_to_remove = []
-            for pin_key, pinned_info in self.pinned_messages.items():
-                if pinned_info['chat_id'] == chat_id:
-                    try:
-                        await context.bot.unpin_chat_message(
-                            chat_id=chat_id,
-                            message_id=pinned_info['message_id']
-                        )
-                        unpinned_count += 1
-                        pinned_keys_to_remove.append(pin_key)
-                        logger.info(f"Unpinned message {pinned_info['message_id']} in chat {chat_id}")
-                    except Exception as e:
-                        logger.warning(f"Could not unpin message {pinned_info['message_id']}: {e}")
 
-            # Remove unpinned messages from tracking
-            for pin_key in pinned_keys_to_remove:
-                del self.pinned_messages[pin_key]
+            # # 1) Unpin messages tracked in memory
+            # for pin_key, pinned_info in self.pinned_messages.items():
+            #     if pinned_info['chat_id'] == chat_id:
+            #         try:
+            #             await context.bot.unpin_chat_message(
+            #                 chat_id=chat_id,
+            #                 message_id=pinned_info['message_id']
+            #             )
+            #             unpinned_count += 1
+            #             pinned_keys_to_remove.append(pin_key)
+            #             logger.info(f"Unpinned message {pinned_info['message_id']} in chat {chat_id} (memory-tracked)")
+            #         except Exception as e:
+            #             logger.warning(f"Could not unpin message {pinned_info['message_id']}: {e}")
+            #
+            # for pin_key in pinned_keys_to_remove:
+            #     del self.pinned_messages[pin_key]
+
+            # 2) Also try to unpin by reading pinned_message_id from DB for this chat
+            try:
+                from poll_storage import get_pinned_messages_by_chat
+                pinned_rows = get_pinned_messages_by_chat(chat_id, limit=1)
+                for row in pinned_rows:
+                    pinned_id = row.get('pinned_message_id')
+                    if pinned_id:
+                        try:
+                            await context.bot.unpin_chat_message(chat_id=chat_id, message_id=int(pinned_id))
+                            unpinned_count += 1
+                            logger.info(f"Unpinned message {pinned_id} in chat {chat_id} (DB) for poll {row.get('poll_id')}")
+                        except Exception as e:
+                            logger.warning(f"Could not unpin DB-pinned message {pinned_id} in chat {chat_id}: {e}")
+            except Exception as e:
+                logger.warning(f"Could not fetch pinned messages from DB for chat {chat_id}: {e}")
 
             # Send short playful confirmation message (randomized) unless suppressed
             if not suppress_messages and getattr(update, 'message', None) is not None:
