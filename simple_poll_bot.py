@@ -741,6 +741,32 @@ class SimplePollBot:
                 allows_multiple_answers=True
             )
 
+            # Now that the poll was successfully created, proactively cancel any previous tasks for this chat
+            try:
+                # Cancel in-memory asyncio tasks tracked for this chat
+                if chat_id in self.scheduled_tasks:
+                    cancelled_count = 0
+                    for task_info in self.scheduled_tasks[chat_id]:
+                        try:
+                            if not task_info['task'].done():
+                                task_info['task'].cancel()
+                                cancelled_count += 1
+                                logger.info(f"Cancelled {task_info['type']} task for poll {task_info.get('poll_id')} after new poll creation")
+                        except Exception as e:
+                            logger.warning(f"Error cancelling task {task_info.get('type')} for chat {chat_id}: {e}")
+                    del self.scheduled_tasks[chat_id]
+                    logger.info(f"Cleared {cancelled_count} in-memory scheduled tasks for chat {chat_id} after creating new poll")
+
+                # Cancel any persisted/scheduled tasks in DB for this chat
+                try:
+                    from task_storage import cancel_chat_tasks
+                    cancelled_db = cancel_chat_tasks(chat_id)
+                    logger.info(f"Cancelled {cancelled_db} scheduled tasks in database for chat {chat_id} after creating new poll")
+                except Exception as e:
+                    logger.warning(f"Could not cancel DB scheduled tasks for chat {chat_id} after creating new poll: {e}")
+            except Exception as e:
+                logger.warning(f"Unexpected error while cancelling previous tasks for chat {chat_id} after creating new poll: {e}")
+
             # Track this poll for voting monitoring
             poll_id = poll_message.poll.id
             self.active_polls[poll_id] = {
@@ -777,9 +803,9 @@ class SimplePollBot:
 
             await query.edit_message_text(
                 f"✅ Опрос '{session['question']}' создан!\n"
-                f"📊 Вариантов: {len(options)}\n"
-                f"💪 Отправлю подтверждение участия перед встречей\n"
-                f"🎉 Уведомлю когда все будут готовы!"
+                f"🧹 Все ранее запланированные задачи для этого чата отменены (если были).\n"
+                f"🗓️ Для этого опроса будут запланированы новые напоминания и действия.\n"
+                f"⏳ Если в течение 2 дней не проголосуют все участники, опрос будет закрыт."
             )
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка: {e}")
@@ -2489,7 +2515,7 @@ class SimplePollBot:
                 if complete_immediate_confirmation:
                     complete_immediate_confirmation(chat_id, conf_data['message_id'], success_message.message_id)
                     logger.info(f"Immediate confirmation marked as completed in database")
-            elif declined_users:
+            elif total_responses >= total_voters and declined_users:
                 # At least one person declined — inform once with cancellation hint and mention who declined
                 if not conf_data.get('decline_notified'):
                     try:
