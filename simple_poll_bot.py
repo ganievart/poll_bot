@@ -733,6 +733,23 @@ class SimplePollBot:
         options.append("Не могу 😔")
 
         try:
+            # Before creating a new poll, cancel previous tasks using cancel_bot without user-facing messages
+            try:
+                # Create a minimal object providing effective_chat.id for cancel_bot
+                class _MinimalChat:
+                    def __init__(self, chat_id):
+                        self.id = chat_id
+
+                class _MinimalUpdate:
+                    def __init__(self, chat_id):
+                        self.effective_chat = _MinimalChat(chat_id)
+                        self.message = None
+
+                dummy_update = _MinimalUpdate(chat_id)
+                await self.cancel_bot(dummy_update, context, suppress_messages=True)
+            except Exception as e:
+                logger.warning(f"Failed to pre-cancel tasks via cancel_bot before creating poll in chat {chat_id}: {e}")
+
             poll_message = await context.bot.send_poll(
                 chat_id=session['chat_id'],
                 question=session['question'],
@@ -741,31 +758,7 @@ class SimplePollBot:
                 allows_multiple_answers=True
             )
 
-            # Now that the poll was successfully created, proactively cancel any previous tasks for this chat
-            try:
-                # Cancel in-memory asyncio tasks tracked for this chat
-                if chat_id in self.scheduled_tasks:
-                    cancelled_count = 0
-                    for task_info in self.scheduled_tasks[chat_id]:
-                        try:
-                            if not task_info['task'].done():
-                                task_info['task'].cancel()
-                                cancelled_count += 1
-                                logger.info(f"Cancelled {task_info['type']} task for poll {task_info.get('poll_id')} after new poll creation")
-                        except Exception as e:
-                            logger.warning(f"Error cancelling task {task_info.get('type')} for chat {chat_id}: {e}")
-                    del self.scheduled_tasks[chat_id]
-                    logger.info(f"Cleared {cancelled_count} in-memory scheduled tasks for chat {chat_id} after creating new poll")
-
-                # Cancel any persisted/scheduled tasks in DB for this chat
-                try:
-                    from task_storage import cancel_chat_tasks
-                    cancelled_db = cancel_chat_tasks(chat_id)
-                    logger.info(f"Cancelled {cancelled_db} scheduled tasks in database for chat {chat_id} after creating new poll")
-                except Exception as e:
-                    logger.warning(f"Could not cancel DB scheduled tasks for chat {chat_id} after creating new poll: {e}")
-            except Exception as e:
-                logger.warning(f"Unexpected error while cancelling previous tasks for chat {chat_id} after creating new poll: {e}")
+            # Previous cancellation handled via cancel_bot above
 
             # Track this poll for voting monitoring
             poll_id = poll_message.poll.id
@@ -1716,8 +1709,9 @@ class SimplePollBot:
         except Exception as e:
             logger.error(f"Error unpinning confirmation message: {e}")
 
-    async def cancel_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel all scheduled tasks and unpin messages for this chat"""
+    async def cancel_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE, suppress_messages: bool = False):
+        """Cancel all scheduled tasks and unpin messages for this chat.
+        If suppress_messages is True, do not send user-facing confirmation text."""
         try:
             chat_id = update.effective_chat.id
 
@@ -1837,16 +1831,17 @@ class SimplePollBot:
             for pin_key in pinned_keys_to_remove:
                 del self.pinned_messages[pin_key]
 
-            # Send short playful confirmation message (randomized)
-            import random
-            messages = [
-                "🧹 Всё почистил! Опросы закрыты, задачи отменены. Можно начать заново с /create_poll",
-                "🛑 Стоп машина! Все опросы закрыты, все напоминания отменены. Готовы к свежему старту: /create_poll",
-                "✅ Готово: опросы закрыты, расписание очищено. Зовите новый /create_poll",
-                "✂️ Перерезал все ниточки — задачи отменены, опросы закрыты. Вперёд к новому /create_poll",
-                "🎈 Чистый лист! Всё отменено и закрыто. Создать новый? /create_poll",
-            ]
-            await update.message.reply_text(random.choice(messages))
+            # Send short playful confirmation message (randomized) unless suppressed
+            if not suppress_messages and getattr(update, 'message', None) is not None:
+                import random
+                messages = [
+                    "🧹 Всё почистил! Опросы закрыты, задачи отменены. Можно начать заново с /create_poll",
+                    "🛑 Стоп машина! Все опросы закрыты, все напоминания отменены. Готовы к свежему старту: /create_poll",
+                    "✅ Готово: опросы закрыты, расписание очищено. Зовите новый /create_poll",
+                    "✂️ Перерезал все ниточки — задачи отменены, опросы закрыты. Вперёд к новому /create_poll",
+                    "🎈 Чистый лист! Всё отменено и закрыто. Создать новый? /create_poll",
+                ]
+                await update.message.reply_text(random.choice(messages))
             logger.info(
                 f"Bot cancelled for chat {chat_id} - {cancelled_count} tasks cancelled, {polls_cleared} polls cleared, {confirmations_cleared} confirmations cleared, {unpinned_count} messages unpinned")
 
